@@ -61,6 +61,19 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec continuation_delay_ms_for_state(term()) :: pos_integer()
+  def continuation_delay_ms_for_state(state_name) when is_binary(state_name) do
+    config = settings!()
+
+    Map.get(
+      config.agent.continuation_delay_ms_by_state,
+      Schema.normalize_issue_state(state_name),
+      1_000
+    )
+  end
+
+  def continuation_delay_ms_for_state(_state_name), do: 1_000
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

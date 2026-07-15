@@ -17,6 +17,8 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.continuation_delay_ms_by_state == %{}
+    assert Config.continuation_delay_ms_for_state("In Review") == 1_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +38,21 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      continuation_delay_ms_by_state: %{"In Review" => 300_000}
+    )
+
+    assert Config.settings!().agent.continuation_delay_ms_by_state == %{"in review" => 300_000}
+    assert Config.continuation_delay_ms_for_state("IN REVIEW") == 300_000
+    assert Config.continuation_delay_ms_for_state("In Progress") == 1_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      continuation_delay_ms_by_state: %{"In Review" => 0}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.continuation_delay_ms_by_state"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -676,6 +693,73 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "normal worker exit uses the configured continuation delay for its issue state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      continuation_delay_ms_by_state: %{"In Review" => 300_000}
+    )
+
+    issue_id = "issue-review-wait"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ReviewContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-558-REVIEW",
+      issue: %Issue{id: issue_id, identifier: "MT-558-REVIEW", state: "In Review"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert_due_in_range(due_at_ms, 299_000, 300_500)
+  end
+
+  test "continuation scheduling refreshes state after review-lane transitions" do
+    in_progress_entry = %{
+      issue: %Issue{id: "issue-enter-review", identifier: "MT-REVIEW", state: "In Progress"}
+    }
+
+    assert Orchestrator.continuation_issue_state_for_test(in_progress_entry, fn ["issue-enter-review"] ->
+             {:ok, [%Issue{id: "issue-enter-review", state: "In Review"}]}
+           end) == "In Review"
+
+    in_review_entry = %{
+      issue: %Issue{id: "issue-enter-merging", identifier: "MT-MERGE", state: "In Review"}
+    }
+
+    assert Orchestrator.continuation_issue_state_for_test(in_review_entry, fn ["issue-enter-merging"] ->
+             {:ok, [%Issue{id: "issue-enter-merging", state: "Merging"}]}
+           end) == "Merging"
+  end
+
+  test "continuation scheduling falls back to the running state when refresh fails" do
+    running_entry = %{
+      issue: %Issue{id: "issue-refresh-failed", identifier: "MT-FALLBACK", state: "In Review"}
+    }
+
+    assert Orchestrator.continuation_issue_state_for_test(running_entry, fn ["issue-refresh-failed"] ->
+             {:error, :timeout}
+           end) == "In Review"
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
