@@ -37,6 +37,9 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      configured_worker_hosts: [],
+      drained_worker_hosts: MapSet.new(),
+      drain_state_path: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -49,9 +52,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+
+    drain_state_path = Keyword.get(opts, :drain_state_path, config.worker.drain_state_path)
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -60,6 +65,9 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      configured_worker_hosts: config.worker.ssh_hosts,
+      drained_worker_hosts: load_drained_worker_hosts(drain_state_path, config.worker.ssh_hosts),
+      drain_state_path: drain_state_path,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
@@ -396,7 +404,31 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
+    state =
+      if state.configured_worker_hosts == [],
+        do: %{state | configured_worker_hosts: Config.settings!().worker.ssh_hosts},
+        else: state
+
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @spec set_drained_worker_hosts([String.t()]) ::
+          {:ok, map()} | {:error, term()} | :timeout | :unavailable
+  def set_drained_worker_hosts(hosts), do: set_drained_worker_hosts(__MODULE__, hosts)
+
+  @spec set_drained_worker_hosts(GenServer.server(), [String.t()], timeout()) ::
+          {:ok, map()} | {:error, term()} | :timeout | :unavailable
+  def set_drained_worker_hosts(server, hosts, timeout \\ 15_000) when is_list(hosts) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, {:set_drained_worker_hosts, hosts}, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -1261,12 +1293,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
-    case Config.settings!().worker.ssh_hosts do
+    case state.configured_worker_hosts do
       [] ->
         nil
 
       hosts ->
-        available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
+        available_hosts =
+          Enum.filter(hosts, fn host ->
+            not MapSet.member?(state.drained_worker_hosts, host) and
+              worker_host_slots_available?(state, host)
+          end)
 
         cond do
           available_hosts == [] ->
@@ -1456,6 +1492,10 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       worker_pool: %{
+         configured_hosts: state.configured_worker_hosts,
+         drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort()
+       },
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1464,6 +1504,27 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call({:set_drained_worker_hosts, hosts}, _from, state) do
+    state = refresh_runtime_config(state)
+    configured_hosts = state.configured_worker_hosts
+
+    with :ok <- validate_drained_worker_hosts(hosts, configured_hosts),
+         drained = MapSet.new(hosts),
+         :ok <- persist_drained_worker_hosts(state.drain_state_path, drained) do
+      updated_state = %{state | drained_worker_hosts: drained}
+
+      {:reply,
+       {:ok,
+        %{
+          configured_hosts: configured_hosts,
+          drained_hosts: drained |> MapSet.to_list() |> Enum.sort(),
+          active_drained_hosts: active_drained_worker_hosts(updated_state)
+        }}, updated_state}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1613,12 +1674,120 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
+    state = reconcile_worker_pool_config(state, config.worker)
 
     %{
       state
       | poll_interval_ms: config.polling.interval_ms,
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
+  end
+
+  defp reconcile_worker_pool_config(%State{} = state, worker_config) do
+    configured_hosts = worker_config.ssh_hosts
+    drain_state_path = worker_config.drain_state_path
+
+    if configured_hosts == state.configured_worker_hosts and drain_state_path == state.drain_state_path do
+      state
+    else
+      reconcile_changed_worker_pool_config(state, configured_hosts, drain_state_path)
+    end
+  end
+
+  defp reconcile_changed_worker_pool_config(state, configured_hosts, drain_state_path) do
+    if drain_state_path != state.drain_state_path do
+      %{
+        state
+        | configured_worker_hosts: configured_hosts,
+          drained_worker_hosts: load_drained_worker_hosts(drain_state_path, configured_hosts),
+          drain_state_path: drain_state_path
+      }
+    else
+      drained = MapSet.intersection(state.drained_worker_hosts, MapSet.new(configured_hosts))
+
+      case persist_drained_worker_hosts(drain_state_path, drained) do
+        :ok ->
+          %{
+            state
+            | configured_worker_hosts: configured_hosts,
+              drained_worker_hosts: drained,
+              drain_state_path: drain_state_path
+          }
+
+        {:error, reason} ->
+          Logger.error("Worker drain config reload failed path=#{inspect(drain_state_path)} reason=#{inspect(reason)}; draining all configured workers")
+
+          %{
+            state
+            | configured_worker_hosts: configured_hosts,
+              drained_worker_hosts: MapSet.new(configured_hosts),
+              drain_state_path: drain_state_path
+          }
+      end
+    end
+  end
+
+  defp validate_drained_worker_hosts(hosts, configured_hosts) do
+    invalid_hosts =
+      hosts
+      |> Enum.reject(&(is_binary(&1) and &1 != "" and &1 in configured_hosts))
+      |> Enum.uniq()
+
+    if invalid_hosts == [],
+      do: :ok,
+      else: {:error, {:unknown_worker_hosts, invalid_hosts}}
+  end
+
+  defp active_drained_worker_hosts(%State{} = state) do
+    running_hosts = Enum.map(state.running, fn {_issue_id, entry} -> Map.get(entry, :worker_host) end)
+    retry_hosts = Enum.map(state.retry_attempts, fn {_issue_id, entry} -> Map.get(entry, :worker_host) end)
+
+    (running_hosts ++ retry_hosts)
+    |> Enum.filter(&MapSet.member?(state.drained_worker_hosts, &1))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp load_drained_worker_hosts(nil, _configured_hosts), do: MapSet.new()
+
+  defp load_drained_worker_hosts(path, configured_hosts) do
+    with {:ok, contents} <- File.read(path),
+         {:ok, %{"drained_worker_hosts" => hosts}} when is_list(hosts) <- Jason.decode(contents),
+         :ok <- validate_drained_worker_hosts(hosts, configured_hosts) do
+      MapSet.new(hosts)
+    else
+      {:error, :enoent} ->
+        drained = MapSet.new(configured_hosts)
+
+        case persist_drained_worker_hosts(path, drained) do
+          :ok -> :ok
+          {:error, reason} -> Logger.error("Worker drain state initialization failed path=#{path} reason=#{inspect(reason)}")
+        end
+
+        drained
+
+      reason ->
+        Logger.error("Invalid worker drain state path=#{path} reason=#{inspect(reason)}; draining all configured workers")
+        MapSet.new(configured_hosts)
+    end
+  end
+
+  defp persist_drained_worker_hosts(nil, _drained), do: :ok
+
+  defp persist_drained_worker_hosts(path, drained) do
+    directory = Path.dirname(path)
+    temporary = path <> ".tmp"
+    payload = Jason.encode!(%{drained_worker_hosts: drained |> MapSet.to_list() |> Enum.sort()})
+
+    with :ok <- File.mkdir_p(directory),
+         :ok <- File.write(temporary, payload, [:sync]),
+         :ok <- File.rename(temporary, path) do
+      :ok
+    else
+      {:error, reason} ->
+        _ = File.rm(temporary)
+        {:error, {:drain_state_write_failed, reason}}
+    end
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do

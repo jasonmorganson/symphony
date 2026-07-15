@@ -2137,6 +2137,8 @@ Extension config:
   - When omitted, work runs locally.
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
   - Shared per-host cap applied across configured SSH hosts.
+- `worker.drain_state_path` (path, OPTIONAL)
+  - Durable scheduler-owned worker drain state used by authenticated control-plane updates.
 
 ### A.1 Execution Model
 
@@ -2160,6 +2162,12 @@ Extension config:
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
+- Hosts in the scheduler-owned drain set are excluded from new dispatch, including preferred retry
+  placement. Updating the drain set is serialized with dispatch and persisted before acknowledgment
+  when `worker.drain_state_path` is configured.
+- The worker-drain mutation endpoint requires `SYMPHONY_WORKER_DRAIN_TOKEN`. A configured missing,
+  unreadable, or invalid drain-state file fails closed by draining all configured hosts until an
+  authenticated control-plane reconciliation succeeds.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - Implementations MAY fail over to another host when the original host is unavailable before work

@@ -21,6 +21,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          worker_pool: snapshot.worker_pool,
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -60,6 +61,17 @@ defmodule SymphonyElixirWeb.Presenter do
 
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
+    end
+  end
+
+  @spec worker_drains_payload(GenServer.name(), [String.t()]) ::
+          {:ok, map()} | {:error, term()}
+  def worker_drains_payload(orchestrator, hosts) do
+    case Orchestrator.set_drained_worker_hosts(orchestrator, hosts) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, reason} -> {:error, reason}
+      :timeout -> {:error, :timeout}
+      :unavailable -> {:error, :unavailable}
     end
   end
 

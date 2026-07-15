@@ -958,6 +958,20 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "select_worker_host_for_test excludes drained hosts including a preferred retry host" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{drained_worker_hosts: MapSet.new(["worker-a"])}
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-b"
+
+    all_drained = %{state | drained_worker_hosts: MapSet.new(["worker-a", "worker-b"])}
+    assert Orchestrator.select_worker_host_for_test(all_drained, nil) == :no_worker_capacity
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 

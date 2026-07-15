@@ -164,7 +164,13 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
+  `/api/v1/worker-drains`.
+- `worker.drain_state_path` enables a durable scheduler-owned drain set. `PUT
+  /api/v1/worker-drains` requires a bearer token from `SYMPHONY_WORKER_DRAIN_TOKEN`, persists the
+  requested `drained_worker_hosts` before acknowledging it, and excludes drained hosts from new
+  and preferred-retry dispatch. A configured missing or invalid state file starts with every host
+  drained until the control plane reconciles availability.
 
 ## Web dashboard
 

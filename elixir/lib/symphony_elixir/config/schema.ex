@@ -115,12 +115,13 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
+      field(:drain_state_path, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host, :drain_state_path], empty_values: [])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
     end
   end
@@ -392,13 +393,18 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    worker = %{
+      settings.worker
+      | drain_state_path: resolve_optional_path_value(settings.worker.drain_state_path)
+    }
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, worker: worker, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -447,6 +453,15 @@ defmodule SymphonyElixir.Config.Schema do
 
       path ->
         path
+    end
+  end
+
+  defp resolve_optional_path_value(nil), do: nil
+
+  defp resolve_optional_path_value(value) when is_binary(value) do
+    case resolve_path_value(value, nil) do
+      nil -> nil
+      path -> Path.expand(path)
     end
   end
 

@@ -1030,9 +1030,31 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.max_concurrent_agents_for_state("Closed") == 10
     assert Config.max_concurrent_agents_for_state(:not_a_string) == 10
 
-    write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
+    drain_state_path = Path.join(System.tmp_dir!(), "worker-drains.json")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_max_concurrent_agents_per_host: 2,
+      worker_drain_state_path: drain_state_path
+    )
+
     assert :ok = Config.validate!()
     assert Config.settings!().worker.max_concurrent_agents_per_host == 2
+    assert Config.settings!().worker.drain_state_path == drain_state_path
+
+    previous_drain_path = System.get_env("SYMPHONY_TEST_DRAIN_PATH")
+    on_exit(fn -> restore_env("SYMPHONY_TEST_DRAIN_PATH", previous_drain_path) end)
+    System.put_env("SYMPHONY_TEST_DRAIN_PATH", "~/symphony-worker-drains.json")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_drain_state_path: "$SYMPHONY_TEST_DRAIN_PATH"
+    )
+
+    assert Config.settings!().worker.drain_state_path ==
+             Path.expand("~/symphony-worker-drains.json")
+
+    System.delete_env("SYMPHONY_TEST_DRAIN_PATH")
+    write_workflow_file!(Workflow.workflow_file_path(), worker_drain_state_path: "$SYMPHONY_TEST_DRAIN_PATH")
+    assert Config.settings!().worker.drain_state_path == nil
   end
 
   test "schema helpers cover custom type and state limit validation" do

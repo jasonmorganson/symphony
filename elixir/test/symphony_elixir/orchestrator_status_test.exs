@@ -21,6 +21,73 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     send(pid, :stop)
   end
 
+  test "worker drains are persisted, restored, and report active drained hosts atomically" do
+    drain_path = Path.join(System.tmp_dir!(), "symphony-drains-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> File.rm(drain_path) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_drain_state_path: drain_path
+    )
+
+    first_name = Module.concat(__MODULE__, :DrainPersistenceOrchestratorOne)
+    {:ok, first} = Orchestrator.start_link(name: first_name)
+    initial_state = :sys.get_state(first)
+    assert initial_state.drained_worker_hosts == MapSet.new(["worker-a", "worker-b"])
+
+    :sys.replace_state(first, fn _ ->
+      %{initial_state | running: %{"issue-1" => %{worker_host: "worker-b"}}}
+    end)
+
+    assert {:ok,
+            %{
+              drained_hosts: ["worker-b"],
+              active_drained_hosts: ["worker-b"]
+            }} = Orchestrator.set_drained_worker_hosts(first_name, ["worker-b"])
+
+    assert {:error, {:unknown_worker_hosts, ["worker-c"]}} =
+             Orchestrator.set_drained_worker_hosts(first_name, ["worker-c"])
+
+    GenServer.stop(first)
+
+    second_name = Module.concat(__MODULE__, :DrainPersistenceOrchestratorTwo)
+    {:ok, second} = Orchestrator.start_link(name: second_name)
+    on_exit(fn -> if Process.alive?(second), do: GenServer.stop(second) end)
+
+    assert :sys.get_state(second).drained_worker_hosts == MapSet.new(["worker-b"])
+    assert Orchestrator.select_worker_host_for_test(:sys.get_state(second), nil) == "worker-a"
+  end
+
+  test "worker drain path and configured hosts reconcile atomically on workflow reload" do
+    first_path = Path.join(System.tmp_dir!(), "symphony-drains-one-#{System.unique_integer([:positive])}.json")
+    second_path = Path.join(System.tmp_dir!(), "symphony-drains-two-#{System.unique_integer([:positive])}.json")
+    on_exit(fn -> Enum.each([first_path, second_path], &File.rm/1) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_drain_state_path: first_path
+    )
+
+    name = Module.concat(__MODULE__, :DrainReloadOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: name)
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    assert {:ok, _payload} = Orchestrator.set_drained_worker_hosts(name, ["worker-b"])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-c"],
+      worker_drain_state_path: second_path
+    )
+
+    assert {:ok, %{drained_hosts: ["worker-c"]}} =
+             Orchestrator.set_drained_worker_hosts(name, ["worker-c"])
+
+    state = :sys.get_state(pid)
+    assert state.configured_worker_hosts == ["worker-a", "worker-c"]
+    assert state.drained_worker_hosts == MapSet.new(["worker-c"])
+    assert Jason.decode!(File.read!(first_path)) == %{"drained_worker_hosts" => ["worker-b"]}
+    assert Jason.decode!(File.read!(second_path)) == %{"drained_worker_hosts" => ["worker-c"]}
+  end
+
   test "orchestrator snapshot reflects last codex update and session id" do
     issue_id = "issue-snapshot"
 
