@@ -10,7 +10,6 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
-  @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -209,6 +208,7 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
+        issue_state: continuation_issue_state(running_entry),
         worker_host: Map.get(running_entry, :worker_host),
         workspace_path: Map.get(running_entry, :workspace_path)
       })
@@ -1191,11 +1191,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
+      Config.continuation_delay_ms_for_state(metadata[:issue_state])
     else
       failure_retry_delay(attempt)
     end
   end
+
+  defp continuation_issue_state(running_entry) do
+    continuation_issue_state(running_entry, &Tracker.fetch_issue_states_by_ids/1)
+  end
+
+  @doc false
+  @spec continuation_issue_state_for_test(term(), ([String.t()] -> term())) :: String.t() | nil
+  def continuation_issue_state_for_test(running_entry, issue_fetcher)
+      when is_function(issue_fetcher, 1) do
+    continuation_issue_state(running_entry, issue_fetcher)
+  end
+
+  defp continuation_issue_state(%{issue: %Issue{id: issue_id} = issue}, issue_fetcher)
+       when is_binary(issue_id) and is_function(issue_fetcher, 1) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, [%Issue{state: state} | _]} when is_binary(state) -> state
+      _ -> issue.state
+    end
+  end
+
+  defp continuation_issue_state(%{issue: %Issue{state: state}}, _issue_fetcher), do: state
+  defp continuation_issue_state(_running_entry, _issue_fetcher), do: nil
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)
