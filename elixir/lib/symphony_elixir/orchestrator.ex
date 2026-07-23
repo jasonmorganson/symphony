@@ -466,6 +466,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec handle_retry_issue_for_test(
+          term(),
+          String.t(),
+          non_neg_integer(),
+          map(),
+          ([String.t()] -> term())
+        ) :: term()
+  def handle_retry_issue_for_test(%State{} = state, issue_id, attempt, metadata, issue_fetcher)
+      when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) and
+             is_function(issue_fetcher, 1) do
+    {:noreply, updated_state} =
+      handle_retry_issue(state, issue_id, attempt, metadata, issue_fetcher)
+
+    updated_state
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -1319,11 +1336,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
+    handle_retry_issue(state, issue_id, attempt, metadata, &Tracker.fetch_issues_by_ids/1)
+  end
+
+  defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata, issue_fetcher)
+       when is_function(issue_fetcher, 1) do
+    case issue_fetcher.([issue_id]) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+
+      {:error, {:linear_rate_limited, retry_after_ms} = reason}
+      when is_integer(retry_after_ms) and retry_after_ms >= 0 ->
+        Logger.warning("Retry poll deferred for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id} because Linear is rate limited retry_after_ms=#{retry_after_ms}")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt,
+           Map.merge(metadata, %{
+             delay_type: :rate_limit,
+             retry_after_ms: retry_after_ms,
+             error: "retry poll failed: #{inspect(reason)}"
+           })
+         )}
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")

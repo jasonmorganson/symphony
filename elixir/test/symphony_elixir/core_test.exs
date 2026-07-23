@@ -1123,6 +1123,34 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "rate-limited retry poll preserves its attempt and shared cooldown" do
+    issue_id = "issue-retry-linear-cooldown"
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    updated_state =
+      Orchestrator.handle_retry_issue_for_test(
+        state,
+        issue_id,
+        7,
+        %{identifier: "MT-RETRY-COOLDOWN"},
+        fn ["issue-retry-linear-cooldown"] ->
+          {:error, {:linear_rate_limited, 60_000}}
+        end
+      )
+
+    assert %{
+             attempt: 7,
+             due_at_ms: due_at_ms,
+             error: "retry poll failed: {:linear_rate_limited, 60000}"
+           } = updated_state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, 59_000, 60_500)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
