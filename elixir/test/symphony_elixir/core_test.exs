@@ -488,6 +488,77 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(second_worker_pid)
   end
 
+  test "a full dispatch batch leaves the orchestrator responsive with candidates remaining" do
+    issue_suffix = System.unique_integer([:positive])
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-full-dispatch-batch-#{issue_suffix}"
+      )
+
+    hook_marker = Path.join(test_root, "before-run-started")
+    hook_fifo = Path.join(test_root, "before-run-blocker")
+    runtime_supervisor_name = Module.concat(__MODULE__, "BatchRuntime#{issue_suffix}")
+    task_supervisor_name = Module.concat(__MODULE__, "BatchTaskSupervisor#{issue_suffix}")
+    orchestrator_name = Module.concat(__MODULE__, "BatchOrchestrator#{issue_suffix}")
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    issues =
+      Enum.map(1..2, fn index ->
+        %Issue{
+          id: "issue-batch-#{issue_suffix}-#{index}",
+          identifier: "MT-#{issue_suffix}-#{index}",
+          title: "Dispatch batch issue #{index}",
+          description: "Keep one worker active while another candidate remains",
+          state: "In Progress",
+          url: "https://example.org/issues/MT-#{issue_suffix}-#{index}",
+          labels: [],
+          dispatchable: true
+        }
+      end)
+
+    on_exit(fn ->
+      if pid = Process.whereis(runtime_supervisor_name) do
+        GenServer.stop(pid)
+      end
+
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restart_default_runtime!()
+      File.rm_rf(test_root)
+    end)
+
+    if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
+      assert :ok =
+               Supervisor.terminate_child(
+                 SymphonyElixir.Supervisor,
+                 SymphonyElixir.AgentRuntimeSupervisor
+               )
+    end
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: test_root,
+      max_concurrent_agents: 1,
+      poll_interval_ms: 30_000,
+      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
+      hook_timeout_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
+
+    assert {:ok, runtime_supervisor_pid} =
+             SymphonyElixir.AgentRuntimeSupervisor.start_link(
+               name: runtime_supervisor_name,
+               task_supervisor_name: task_supervisor_name,
+               orchestrator_name: orchestrator_name
+             )
+
+    Process.unlink(runtime_supervisor_pid)
+    assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
+    assert is_map(Orchestrator.snapshot(orchestrator_name, 1_000))
+  end
+
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_ids([])
   end
