@@ -90,6 +90,9 @@ Supported release targets:
 `v*` tags publish all four targets with checksums. A manual workflow run builds the same
 artifacts without creating a release.
 
+Set `SYMPHONY_RELEASE_FORMAT=otp` when a container or deployment system needs the standard
+unwrapped OTP release directory from `mix release` instead of a Burrito executable.
+
 After downloading the executable for your platform from a release:
 
 ```bash
