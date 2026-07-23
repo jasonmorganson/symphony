@@ -901,6 +901,16 @@ defmodule SymphonyElixir.Orchestrator do
     {selected, remaining} =
       select_dispatch_candidates(issues, state, active_states, terminal_states)
 
+    case selected do
+      [] ->
+        state
+
+      _selected ->
+        dispatch_selected_candidates(selected, remaining, state, active_states, terminal_states)
+    end
+  end
+
+  defp dispatch_selected_candidates(selected, remaining, state, active_states, terminal_states) do
     case revalidate_dispatch_candidates(selected, &Tracker.fetch_issues_by_ids/1) do
       {:ok, refreshed_issues} ->
         updated_state =
