@@ -558,6 +558,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
+    assert html =~ "Latest Codex and Linear tracker quota snapshots"
+    assert html =~ "Linear tracker"
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
