@@ -22,6 +22,7 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           worker_pool: snapshot.worker_pool,
+          tracker: Map.get(snapshot, :tracker),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }

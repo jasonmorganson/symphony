@@ -257,6 +257,15 @@ codex:
   even when the HTTP wrapper reports `400`; it activates one process-wide cooldown shared by
   polling, issue refreshes, and `linear_graphql`. A completed agent turn deferred by that cooldown
   is not converted into a failed run; its continuation check waits for the cooldown deadline.
+  Successful and error responses also update a sanitized snapshot of Linear request, endpoint, and
+  complexity quota headers for `/api/v1/state`; authentication and other response headers are never
+  retained.
+- Request volume: candidate polling is skipped while all orchestrator agent slots are occupied,
+  preserving the most recent candidate counts. It continues when workers are unavailable so an
+  external capacity controller can detect new demand and wake them. Before dispatch, selected candidates are
+  revalidated in one ID-batched tracker request rather than one request per issue. The state API
+  exposes the latest candidate observation as `tracker` with `runnable_issues`, `blocked_issues`,
+  and `observed_at`.
 
 ### GitHub Issues adapter
 
