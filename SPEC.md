@@ -289,8 +289,10 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
+- `tracker_counts` (latest candidate-poll counts for runnable and blocked issues, plus observation time)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- tracker rate-limit telemetry (latest sanitized quota headers observed by the tracker adapter)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -1556,7 +1558,20 @@ Minimum endpoints:
         "total_tokens": 7400,
         "seconds_running": 1834.2
       },
-      "rate_limits": null
+      "rate_limits": null,
+      "tracker": {
+        "runnable_issues": 5,
+        "blocked_issues": 2,
+        "observed_at": "2026-02-24T20:15:00Z"
+      },
+      "tracker_rate_limits": {
+        "observed_at": "2026-02-24T20:15:00Z",
+        "requests": {
+          "limit": 1500,
+          "remaining": 1421,
+          "reset_at_ms": 1771965000000
+        }
+      }
     }
     ```
 

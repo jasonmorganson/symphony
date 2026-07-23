@@ -41,6 +41,7 @@ defmodule SymphonyElixir.Orchestrator do
       configured_worker_hosts: [],
       drained_worker_hosts: MapSet.new(),
       drain_state_path: nil,
+      tracker_counts: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -303,8 +304,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
+         {:ok, issues, state} <-
+           fetch_candidates(state, &Tracker.fetch_issues_by_states/1) do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -345,9 +346,49 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
         state
 
-      false ->
+      {:tracker_error, reason, state} ->
+        Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
+        state
+
+      {:skip, state} ->
         state
     end
+  end
+
+  @doc false
+  @spec fetch_candidates_for_test(term(), ([String.t()] -> term())) ::
+          {:skip, term()} | {:ok, [Issue.t()], term()} | {:tracker_error, term(), term()}
+  def fetch_candidates_for_test(%State{} = state, fetcher) when is_function(fetcher, 1) do
+    fetch_candidates(state, fetcher)
+  end
+
+  defp fetch_candidates(%State{} = state, fetcher) when is_function(fetcher, 1) do
+    if available_slots(state) > 0 do
+      case fetcher.(Config.settings!().tracker.active_states) do
+        {:ok, issues} when is_list(issues) ->
+          {:ok, issues, cache_tracker_counts(state, issues)}
+
+        {:error, reason} ->
+          {:tracker_error, reason, %{state | tracker_counts: nil}}
+      end
+    else
+      {:skip, state}
+    end
+  end
+
+  defp cache_tracker_counts(%State{} = state, issues) when is_list(issues) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+    runnable_issues = Enum.count(issues, &candidate_issue?(&1, active_states, terminal_states))
+
+    %{
+      state
+      | tracker_counts: %{
+          runnable_issues: runnable_issues,
+          blocked_issues: max(length(issues) - runnable_issues, 0),
+          observed_at: DateTime.utc_now()
+        }
+    }
   end
 
   defp reconcile_running_issues(%State{} = state) do
@@ -851,13 +892,135 @@ defmodule SymphonyElixir.Orchestrator do
 
     issues
     |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
+    |> dispatch_candidate_batches(state, active_states, terminal_states)
+  end
+
+  defp dispatch_candidate_batches([], state, _active_states, _terminal_states), do: state
+
+  defp dispatch_candidate_batches(issues, state, active_states, terminal_states) do
+    {selected, remaining} =
+      select_dispatch_candidates(issues, state, active_states, terminal_states)
+
+    case revalidate_dispatch_candidates(selected, &Tracker.fetch_issues_by_ids/1) do
+      {:ok, refreshed_issues} ->
+        updated_state =
+          dispatch_revalidated_candidates(
+            {:ok, refreshed_issues},
+            state,
+            active_states,
+            terminal_states
+          )
+
+        dispatch_candidate_batches(remaining, updated_state, active_states, terminal_states)
+
+      {:error, reason} ->
+        dispatch_revalidated_candidates({:error, reason}, state, active_states, terminal_states)
+    end
+  end
+
+  defp dispatch_revalidated_candidates({:ok, issues}, state, active_states, terminal_states) do
+    Enum.reduce(issues, state, fn issue, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
+        do_dispatch_issue(state_acc, issue, nil, nil)
       else
         state_acc
       end
     end)
+  end
+
+  defp dispatch_revalidated_candidates({:error, reason}, state, _active_states, _terminal_states) do
+    Logger.warning("Skipping dispatch batch; issue refresh failed: #{inspect(reason)}")
+    state
+  end
+
+  defp select_dispatch_candidates(issues, state, active_states, terminal_states) do
+    select_dispatch_candidates(issues, [], state, active_states, terminal_states)
+  end
+
+  defp select_dispatch_candidates([], selected, _state, _active_states, _terminal_states) do
+    {Enum.reverse(selected), []}
+  end
+
+  defp select_dispatch_candidates(
+         [issue | remaining] = issues,
+         selected,
+         state,
+         active_states,
+         terminal_states
+       ) do
+    cond do
+      available_slots(state) == 0 ->
+        {Enum.reverse(selected), issues}
+
+      should_dispatch_issue?(issue, state, active_states, terminal_states) ->
+        reservation = %{issue: issue, worker_host: select_worker_host(state, nil)}
+        reserved_running = Map.put(state.running, issue.id, reservation)
+        reserved_state = %{state | running: reserved_running}
+
+        select_dispatch_candidates(
+          remaining,
+          [issue | selected],
+          reserved_state,
+          active_states,
+          terminal_states
+        )
+
+      true ->
+        select_dispatch_candidates(remaining, selected, state, active_states, terminal_states)
+    end
+  end
+
+  @doc false
+  @spec revalidate_dispatch_candidates_for_test([Issue.t()], ([String.t()] -> term())) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def revalidate_dispatch_candidates_for_test(issues, fetcher)
+      when is_list(issues) and is_function(fetcher, 1) do
+    revalidate_dispatch_candidates(issues, fetcher)
+  end
+
+  defp revalidate_dispatch_candidates([], _fetcher), do: {:ok, []}
+
+  defp revalidate_dispatch_candidates(issues, fetcher) do
+    issue_ids = Enum.map(issues, & &1.id)
+
+    case fetcher.(issue_ids) do
+      {:ok, refreshed_issues} when is_list(refreshed_issues) ->
+        refreshed_by_id = Map.new(refreshed_issues, &{&1.id, &1})
+        terminal_states = terminal_state_set()
+
+        valid_issues =
+          Enum.flat_map(
+            issues,
+            &revalidated_dispatch_candidate(&1, refreshed_by_id, terminal_states)
+          )
+
+        {:ok, valid_issues}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp revalidated_dispatch_candidate(original_issue, refreshed_by_id, terminal_states) do
+    case Map.get(refreshed_by_id, original_issue.id) do
+      %Issue{} = refreshed_issue ->
+        keep_revalidated_dispatch_candidate(refreshed_issue, terminal_states)
+
+      nil ->
+        Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(original_issue)}")
+
+        []
+    end
+  end
+
+  defp keep_revalidated_dispatch_candidate(refreshed_issue, terminal_states) do
+    if retry_candidate_issue?(refreshed_issue, terminal_states) do
+      [refreshed_issue]
+    else
+      Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
+
+      []
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -971,19 +1134,6 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case refresh_issue_for_dispatch(issue) do
-      {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
-
-      {:skip, _reason} ->
-        state
-
-      {:error, _reason} ->
-        state
-    end
-  end
-
   defp refresh_issue_for_dispatch(issue) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issues_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -1000,6 +1150,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
         {:error, reason}
     end
   end
@@ -1576,6 +1727,7 @@ defmodule SymphonyElixir.Orchestrator do
          configured_hosts: state.configured_worker_hosts,
          drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort()
        },
+       tracker: state.tracker_counts,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{

@@ -327,6 +327,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "configured_hosts" => ["worker-a", "worker-b"],
                "drained_hosts" => []
              },
+             "tracker" => %{
+               "runnable_issues" => 5,
+               "blocked_issues" => 2,
+               "observed_at" => "2026-07-23T16:00:00Z"
+             },
+             "tracker_rate_limits" => nil,
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -745,6 +751,11 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       worker_pool: %{configured_hosts: ["worker-a", "worker-b"], drained_hosts: []},
+      tracker: %{
+        runnable_issues: 5,
+        blocked_issues: 2,
+        observed_at: ~U[2026-07-23 16:00:00Z]
+      },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }

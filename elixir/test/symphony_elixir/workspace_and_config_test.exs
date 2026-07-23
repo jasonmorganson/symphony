@@ -5,6 +5,183 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.{Client, RateLimit}
 
+  test "full-capacity candidate polling reuses cached tracker counts without fetching" do
+    issue = %Issue{
+      id: "issue-running",
+      identifier: "A-RUNNING",
+      title: "Already running",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{issue.id => %{issue: issue}},
+      tracker_counts: %{runnable_issues: 4, blocked_issues: 2, observed_at: ~U[2026-07-23 16:00:00Z]}
+    }
+
+    fetcher = fn _states ->
+      send(self(), :candidate_fetch_called)
+      {:ok, []}
+    end
+
+    assert {:skip, ^state} = Orchestrator.fetch_candidates_for_test(state, fetcher)
+    refute_receive :candidate_fetch_called
+  end
+
+  test "candidate polling continues with all workers drained so zero capacity can wake" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      configured_worker_hosts: ["worker-0"],
+      drained_worker_hosts: MapSet.new(["worker-0"])
+    }
+
+    fetcher = fn states ->
+      send(self(), {:candidate_fetch_called, states})
+      {:ok, []}
+    end
+
+    assert {:ok, [], updated_state} =
+             Orchestrator.fetch_candidates_for_test(state, fetcher)
+
+    assert updated_state.tracker_counts.runnable_issues == 0
+    assert_receive {:candidate_fetch_called, _states}
+  end
+
+  test "candidate polling caches runnable and blocked issue counts" do
+    runnable = %Issue{
+      id: "issue-runnable",
+      identifier: "A-RUNNABLE",
+      title: "Runnable",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    blocked = %Issue{
+      id: "issue-blocked",
+      identifier: "A-BLOCKED",
+      title: "Blocked",
+      state: "Todo",
+      dispatchable: false
+    }
+
+    fetcher = fn _states -> {:ok, [runnable, blocked]} end
+
+    assert {:ok, [^runnable, ^blocked], updated_state} =
+             Orchestrator.fetch_candidates_for_test(
+               %Orchestrator.State{max_concurrent_agents: 5},
+               fetcher
+             )
+
+    assert %{
+             runnable_issues: 1,
+             blocked_issues: 1,
+             observed_at: %DateTime{}
+           } = updated_state.tracker_counts
+  end
+
+  test "candidate polling invalidates cached demand after a tracker error" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      tracker_counts: %{runnable_issues: 0, blocked_issues: 0, observed_at: DateTime.utc_now()}
+    }
+
+    assert {:tracker_error, :unavailable, updated_state} =
+             Orchestrator.fetch_candidates_for_test(state, fn _states ->
+               {:error, :unavailable}
+             end)
+
+    assert updated_state.tracker_counts == nil
+  end
+
+  test "dispatch candidate revalidation batches selected issue ids into one fetch" do
+    first = %Issue{
+      id: "issue-1",
+      identifier: "A-1",
+      title: "First",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    second = %Issue{
+      id: "issue-2",
+      identifier: "A-2",
+      title: "Second",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    fetcher = fn ids ->
+      send(self(), {:dispatch_refresh_called, ids})
+      {:ok, [second, first]}
+    end
+
+    assert {:ok, [^first, ^second]} =
+             Orchestrator.revalidate_dispatch_candidates_for_test([first, second], fetcher)
+
+    assert_receive {:dispatch_refresh_called, ["issue-1", "issue-2"]}
+    refute_receive {:dispatch_refresh_called, _}
+  end
+
+  test "Linear rate-limit telemetry records sanitized request, endpoint, and complexity headers" do
+    server = start_supervised!({RateLimit, name: Module.concat(__MODULE__, :TelemetryRateLimit)})
+
+    headers = [
+      {"x-ratelimit-requests-limit", "2500"},
+      {"x-ratelimit-requests-remaining", "17"},
+      {"x-ratelimit-requests-reset", "1784826153000"},
+      {"x-ratelimit-endpoint-name", "Issues"},
+      {"x-ratelimit-endpoint-requests-limit", "1000"},
+      {"x-ratelimit-endpoint-requests-remaining", "3"},
+      {"x-ratelimit-endpoint-requests-reset", "1784826153000"},
+      {"x-complexity", "412"},
+      {"x-ratelimit-complexity-limit", "3000000"},
+      {"x-ratelimit-complexity-remaining", "1200"},
+      {"x-ratelimit-complexity-reset", "1784826153000"},
+      {"authorization", "must-not-be-recorded"}
+    ]
+
+    assert :ok = RateLimit.observe(headers, server)
+
+    assert %{
+             observed_at: %DateTime{},
+             requests: %{limit: 2500, remaining: 17, reset_at_ms: 1_784_826_153_000},
+             endpoint: %{
+               name: "Issues",
+               limit: 1000,
+               remaining: 3,
+               reset_at_ms: 1_784_826_153_000
+             },
+             complexity: %{
+               query: 412,
+               limit: 3_000_000,
+               remaining: 1200,
+               reset_at_ms: 1_784_826_153_000
+             }
+           } = RateLimit.snapshot(server)
+
+    refute inspect(RateLimit.snapshot(server)) =~ "must-not-be-recorded"
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => 1_500,
+                 42 => "ignored"
+               },
+               server
+             )
+
+    assert %{requests: %{limit: 1_500}} = RateLimit.snapshot(server)
+
+    assert :ok =
+             RateLimit.observe(
+               [{"x-ratelimit-requests-limit", "invalid"}, :ignored],
+               server
+             )
+
+    assert %{requests: %{limit: 1_500}} = RateLimit.snapshot(server)
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -640,6 +817,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client records rate-limit telemetry from successful responses" do
+    rate_limit_name = Module.concat(__MODULE__, :SuccessfulResponseRateLimit)
+    start_supervised!({RateLimit, name: rate_limit_name})
+
+    request_fun = fn _payload, _headers ->
+      {:ok,
+       %{
+         status: 200,
+         headers: %{
+           "x-ratelimit-requests-limit" => ["1,500"],
+           "x-ratelimit-requests-remaining" => ["1499"]
+         },
+         body: %{"data" => %{"viewer" => %{"id" => "viewer-1"}}}
+       }}
+    end
+
+    assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-1"}}}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: request_fun,
+               rate_limit_server: rate_limit_name
+             )
+
+    assert %{requests: %{limit: 1_500, remaining: 1_499}} =
+             RateLimit.snapshot(rate_limit_name)
+  end
+
   test "linear client converts semantic rate limits into one shared cooldown" do
     rate_limit_name = Module.concat(__MODULE__, :TestLinearRateLimit)
     start_supervised!({RateLimit, name: rate_limit_name})
@@ -714,10 +917,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     unavailable = {:not, :a_server}
     assert :ok = RateLimit.check(unavailable)
     assert :ok = RateLimit.activate(1_000, unavailable)
+    assert :ok = RateLimit.observe(%{}, unavailable)
+    assert RateLimit.snapshot(unavailable) == nil
     assert :ok = RateLimit.reset(unavailable)
 
     assert :ok = RateLimit.activate(0)
     assert :ok = RateLimit.check()
+    assert :ok = RateLimit.observe(%{})
     assert :ok = RateLimit.reset()
   end
 

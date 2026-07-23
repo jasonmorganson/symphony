@@ -6,11 +6,23 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Tracker
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    payload =
+      orchestrator()
+      |> Presenter.state_payload(snapshot_timeout_ms())
+      |> maybe_put_tracker_rate_limits()
+
+    json(conn, payload)
+  end
+
+  defp maybe_put_tracker_rate_limits(%{error: _error} = payload), do: payload
+
+  defp maybe_put_tracker_rate_limits(payload) do
+    Map.put(payload, :tracker_rate_limits, Tracker.rate_limit_snapshot())
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
