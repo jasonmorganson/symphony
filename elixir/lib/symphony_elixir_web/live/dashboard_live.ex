@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Tracker
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -116,11 +117,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+              <p class="section-copy">Latest Codex and Linear tracker quota snapshots, when available.</p>
             </div>
           </div>
 
+          <p class="metric-label">Codex</p>
           <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <p class="metric-label">Linear tracker</p>
+          <pre class="code-panel"><%= pretty_value(@payload.tracker_rate_limits) %></pre>
         </section>
 
         <section class="section-card">
@@ -330,7 +334,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp load_payload do
-    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
+    case Presenter.state_payload(orchestrator(), snapshot_timeout_ms()) do
+      %{error: _error} = payload ->
+        payload
+
+      payload ->
+        Map.put(payload, :tracker_rate_limits, Tracker.rate_limit_snapshot())
+    end
   end
 
   defp orchestrator do
