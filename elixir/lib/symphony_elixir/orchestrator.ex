@@ -171,6 +171,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
+        {:agent_rate_limit_deferred, issue_id, retry_after_ms},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) and is_integer(retry_after_ms) and retry_after_ms >= 0 do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry =
+          Map.put(running_entry, :rate_limit_retry_after_ms, retry_after_ms)
+
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
       ) do
@@ -212,21 +229,40 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        issue_state: continuation_issue_state(running_entry),
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      is_integer(running_entry[:rate_limit_retry_after_ms]) ->
+        retry_after_ms = running_entry.rate_limit_retry_after_ms
+
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; deferring active-state continuation check for Linear cooldown retry_after_ms=#{retry_after_ms}")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :rate_limit,
+          retry_after_ms: retry_after_ms,
+          issue_state: running_entry.issue.state,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          issue_state: continuation_issue_state(running_entry),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
 
@@ -1261,10 +1297,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      Config.continuation_delay_ms_for_state(metadata[:issue_state])
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :rate_limit and is_integer(metadata[:retry_after_ms]) ->
+        metadata.retry_after_ms
+
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        Config.continuation_delay_ms_for_state(metadata[:issue_state])
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 

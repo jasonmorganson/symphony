@@ -1036,6 +1036,22 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "agent runner defers a completed turn while Linear is rate limited" do
+    issue = %Issue{
+      id: "issue-linear-cooldown",
+      identifier: "MT-COOLDOWN",
+      title: "Preserve completed turn",
+      state: "In Progress"
+    }
+
+    fetcher = fn ["issue-linear-cooldown"] ->
+      {:error, {:linear_rate_limited, 60_000}}
+    end
+
+    assert {:defer, ^issue, 60_000} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1074,6 +1090,48 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "rate-limited worker exit schedules one continuation check after the shared cooldown" do
+    issue_id = "issue-rate-limit-continuation"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RATE-LIMIT",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-RATE-LIMIT",
+        state: "In Progress"
+      },
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_rate_limit_deferred, issue_id, 60_000})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    assert %{attempt: 1, due_at_ms: due_at_ms, error: nil} = state.retry_attempts[issue_id]
+    assert_due_in_range(due_at_ms, 59_000, 60_500)
   end
 
   test "normal worker exit uses the configured continuation delay for its issue state" do

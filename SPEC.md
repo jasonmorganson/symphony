@@ -754,6 +754,13 @@ Tick sequence:
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
 
+Tracker clients SHOULD recognize provider rate-limit errors even when an intermediary returns an
+HTTP status other than 429. While a provider cooldown is active, all tracker calls in the service
+MUST fail locally with a typed rate-limit error instead of consuming additional requests. A
+completed agent turn whose final issue-state refresh is rate limited MUST be deferred without
+turning the completed turn into an agent failure; its single continuation check SHOULD be delayed
+until the shared cooldown expires.
+
 ### 8.2 Candidate Selection Rules
 
 An issue is dispatch-eligible only if all are true:
@@ -2121,6 +2128,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   portable error mapping
 - Error mapping covers config, request, non-success response, malformed payload, pagination, and
   rate limiting, including documented category/message mappings for language-native errors
+- Provider-native rate-limit payloads map to the rate-limit category even when their HTTP wrapper
+  status differs, and repeated requests share a process-wide cooldown
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
@@ -2135,6 +2144,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
+- Rate-limited final state refresh defers the completed turn and schedules its continuation check
+  for the shared cooldown deadline without escalating the failure attempt
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate

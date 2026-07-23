@@ -3,7 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, RateLimit}
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -638,6 +638,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+  end
+
+  test "linear client converts semantic rate limits into one shared cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :TestLinearRateLimit)
+    start_supervised!({RateLimit, name: rate_limit_name})
+    {:ok, request_count} = Agent.start_link(fn -> 0 end)
+
+    request_fun = fn _payload, _headers ->
+      Agent.update(request_count, &(&1 + 1))
+
+      {:ok,
+       %{
+         status: 400,
+         headers: %{"retry-after" => ["1"]},
+         body: %{
+           "errors" => [
+             %{
+               "message" => "Rate limit exceeded.",
+               "extensions" => %{
+                 "code" => "RATELIMITED",
+                 "statusCode" => 429,
+                 "meta" => %{
+                   "rateLimitResult" => %{
+                     "allowed" => false,
+                     "duration" => 3_600_000,
+                     "limit" => 2_500,
+                     "remaining" => 0,
+                     "requested" => 1
+                   }
+                 }
+               }
+             }
+           ]
+         }
+       }}
+    end
+
+    assert {:error, {:linear_rate_limited, retry_after_ms}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: request_fun,
+               rate_limit_server: rate_limit_name
+             )
+
+    assert retry_after_ms >= 1_000
+    assert Agent.get(request_count, & &1) == 1
+
+    assert {:error, {:linear_rate_limited, remaining_ms}} =
+             Client.graphql("query Viewer { viewer { id } }", %{},
+               request_fun: request_fun,
+               rate_limit_server: rate_limit_name
+             )
+
+    assert remaining_ms > 0
+    assert Agent.get(request_count, & &1) == 1
+  end
+
+  test "linear rate-limit cooldown expires, resets, and tolerates unavailable servers" do
+    rate_limit_name = Module.concat(__MODULE__, :TestLinearRateLimitLifecycle)
+    rate_limit_pid = start_supervised!({RateLimit, name: rate_limit_name})
+
+    assert :ok = RateLimit.activate(0, rate_limit_pid)
+    Process.sleep(1)
+    assert :ok = RateLimit.check(rate_limit_pid)
+
+    assert :ok = RateLimit.activate(60_000, rate_limit_name)
+
+    assert {:error, {:linear_rate_limited, remaining_ms}} =
+             RateLimit.check(rate_limit_name)
+
+    assert remaining_ms > 0
+    assert :ok = RateLimit.reset(rate_limit_name)
+    assert :ok = RateLimit.check(rate_limit_name)
+
+    unavailable = {:not, :a_server}
+    assert :ok = RateLimit.check(unavailable)
+    assert :ok = RateLimit.activate(1_000, unavailable)
+    assert :ok = RateLimit.reset(unavailable)
+
+    assert :ok = RateLimit.activate(0)
+    assert :ok = RateLimit.check()
+    assert :ok = RateLimit.reset()
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do

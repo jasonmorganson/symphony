@@ -12,7 +12,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
-          {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
+          {:continue, Issue.t()}
+          | {:done, Issue.t()}
+          | {:defer, Issue.t(), non_neg_integer()}
+          | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
     continue_with_issue?(issue, issue_state_fetcher)
@@ -85,6 +88,15 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
+  defp send_rate_limit_deferred(recipient, %Issue{id: issue_id}, retry_after_ms)
+       when is_binary(issue_id) and is_pid(recipient) and is_integer(retry_after_ms) and
+              retry_after_ms >= 0 do
+    send(recipient, {:agent_rate_limit_deferred, issue_id, retry_after_ms})
+    :ok
+  end
+
+  defp send_rate_limit_deferred(_recipient, _issue, _retry_after_ms), do: :ok
+
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
@@ -133,6 +145,12 @@ defmodule SymphonyElixir.AgentRunner do
         {:done, _refreshed_issue} ->
           :ok
 
+        {:defer, _refreshed_issue, retry_after_ms} ->
+          Logger.warning("Deferring issue state continuation for #{issue_context(issue)} because Linear is rate limited retry_after_ms=#{retry_after_ms}")
+          send_rate_limit_deferred(codex_update_recipient, issue, retry_after_ms)
+
+          :ok
+
         {:error, reason} ->
           {:error, reason}
       end
@@ -164,6 +182,10 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:ok, []} ->
         {:done, issue}
+
+      {:error, {:linear_rate_limited, retry_after_ms}}
+      when is_integer(retry_after_ms) and retry_after_ms >= 0 ->
+        {:defer, issue, retry_after_ms}
 
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}

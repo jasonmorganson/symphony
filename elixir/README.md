@@ -250,7 +250,10 @@ codex:
   to `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
   `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
-  human-readable provider detail.
+  human-readable provider detail. Linear's `RATELIMITED` GraphQL payload is treated as a rate limit
+  even when the HTTP wrapper reports `400`; it activates one process-wide cooldown shared by
+  polling, issue refreshes, and `linear_graphql`. A completed agent turn deferred by that cooldown
+  is not converted into a failed run; its continuation check waits for the cooldown deadline.
 
 ### GitHub Issues adapter
 
