@@ -233,6 +233,87 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              30_000
   end
 
+  test "Linear admission paces every request and preserves a quota reserve" do
+    {:ok, monotonic_clock} = Agent.start_link(fn -> 5_000 end)
+
+    server =
+      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :PacingRateLimit), monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end, system_now_fun: fn -> 1_000_000 end})
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "2059",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               server
+             )
+
+    assert :ok = RateLimit.check(server)
+    assert {:error, {:linear_rate_limited, 34}} = RateLimit.check(server)
+
+    assert %{
+             admission: %{deferred_requests: 1, next_request_in_ms: 34}
+           } = RateLimit.snapshot(server)
+
+    Agent.update(monotonic_clock, &(&1 + 34))
+    assert :ok = RateLimit.check(server)
+
+    reserve_server =
+      start_supervised!(%{
+        id: :reserve_rate_limit,
+        start:
+          {RateLimit, :start_link,
+           [
+             [
+               name: Module.concat(__MODULE__, :ReserveRateLimit),
+               monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end,
+               system_now_fun: fn -> 1_000_000 end
+             ]
+           ]}
+      })
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "250",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               reserve_server
+             )
+
+    assert :ok = RateLimit.check(reserve_server)
+    assert {:error, {:linear_rate_limited, 60_000}} = RateLimit.check(reserve_server)
+
+    reset_server =
+      start_supervised!(%{
+        id: :reset_window_rate_limit,
+        start:
+          {RateLimit, :start_link,
+           [
+             [
+               name: Module.concat(__MODULE__, :ResetWindowRateLimit),
+               monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end,
+               system_now_fun: fn -> 1_060_000 end
+             ]
+           ]}
+      })
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "1",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               reset_server
+             )
+
+    assert :ok = RateLimit.check(reset_server)
+    assert :ok = RateLimit.check(reset_server)
+  end
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
