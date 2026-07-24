@@ -263,9 +263,12 @@ codex:
 - Request volume: candidate polling is skipped while all orchestrator agent slots are occupied,
   preserving the most recent candidate counts. It continues when workers are unavailable so an
   external capacity controller can detect new demand and wake them. Before dispatch, selected candidates are
-  revalidated in one ID-batched tracker request rather than one request per issue. The state API
-  exposes the latest candidate observation as `tracker` with `runnable_issues`, `blocked_issues`,
-  and `observed_at`.
+  revalidated in one ID-batched tracker request rather than one request per issue. Running and
+  blocked issue reconciliation also shares one ID-batched refresh per poll cycle. When Linear
+  reports request-quota headers, the next poll is delayed enough to spread an estimated two
+  requests per cycle across the remaining reset window; the configured interval remains the
+  minimum. The state API exposes the latest candidate observation as `tracker` with
+  `runnable_issues`, `blocked_issues`, and `observed_at`.
 
 ### GitHub Issues adapter
 
