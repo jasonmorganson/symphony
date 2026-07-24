@@ -859,8 +859,12 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - the last meaningful Codex activity if any has been seen, else
   - `started_at`
+- Account and rate-limit control-plane notifications are observable telemetry, not meaningful
+  activity. Token-usage notifications count as activity only when a counter advances.
+- Preserve the last meaningful event and message separately so later telemetry cannot erase
+  operator-input or approval evidence.
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
@@ -1181,7 +1185,7 @@ Timeouts:
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
 - `codex.turn_timeout_ms`: maximum silence interval while a turn stream is active; each
   app-server output resets it, so it is not a total turn runtime cap
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `codex.stall_timeout_ms`: enforced by orchestrator based on meaningful agent inactivity
 
 Error mapping (RECOMMENDED normalized categories):
 
