@@ -765,6 +765,11 @@ completed agent turn whose final issue-state refresh is rate limited MUST be def
 turning the completed turn into an agent failure; its single continuation check SHOULD be delayed
 until the shared cooldown expires.
 
+When a tracker reports a remaining request quota and reset window, the client SHOULD pace all
+callers through one process-wide admission boundary and retain a bounded reserve for recovery and
+operator actions. A caller rejected by admission MUST receive the same typed local rate-limit error
+without sending an upstream request.
+
 ### 8.2 Candidate Selection Rules
 
 An issue is dispatch-eligible only if all are true:

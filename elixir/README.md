@@ -267,7 +267,10 @@ codex:
   blocked issue reconciliation also shares one ID-batched refresh per poll cycle. When Linear
   reports request-quota headers, the next poll is delayed enough to spread an estimated two
   requests per cycle across the remaining reset window; the configured interval remains the
-  minimum. The state API exposes the latest candidate observation as `tracker` with
+  minimum. The same shared limiter paces every Linear request across the remaining window and
+  reserves 10% of the hourly quota (at least 100 requests) instead of allowing concurrent agent
+  tools to exhaust it. Locally deferred request counts and the next admission delay are exposed
+  with the quota snapshot. The state API exposes the latest candidate observation as `tracker` with
   `runnable_issues`, `blocked_issues`, and `observed_at`.
 
 ### GitHub Issues adapter
