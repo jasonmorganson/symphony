@@ -738,16 +738,17 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Startup terminal cleanup removes stale workspaces for issues already in terminal states. It runs
+  as a supervised background task so remote cleanup hooks cannot block readiness or polling.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats no sooner than `polling.interval_ms`. A tracker adapter MAY increase the delay using
-provider quota telemetry so polling consumes the remaining request budget gradually until its reset
-window.
+At startup, the service validates config, starts terminal cleanup in the background, schedules an
+immediate tick, and then repeats no sooner than `polling.interval_ms`. A tracker adapter MAY increase
+the delay using provider quota telemetry so polling consumes the remaining request budget gradually
+until its reset window.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
 
@@ -1877,7 +1878,7 @@ function start_service():
     log_validation_error(validation)
     fail_startup(validation)
 
-  startup_terminal_workspace_cleanup()
+  supervise_background(startup_terminal_workspace_cleanup)
   schedule_tick(delay_ms=0)
 
   event_loop(state)
