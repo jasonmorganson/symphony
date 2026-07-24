@@ -740,13 +740,15 @@ Distinct terminal reasons are important because retry logic and logs differ.
 ### 8.1 Poll Loop
 
 At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats every `polling.interval_ms`.
+then repeats no sooner than `polling.interval_ms`. A tracker adapter MAY increase the delay using
+provider quota telemetry so polling consumes the remaining request budget gradually until its reset
+window.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
 
 Tick sequence:
 
-1. Reconcile running issues.
+1. Reconcile running and blocked issues, batching compatible refreshes into one tracker request.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
 4. Sort issues by dispatch priority.

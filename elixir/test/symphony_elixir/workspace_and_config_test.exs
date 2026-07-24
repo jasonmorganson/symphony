@@ -123,6 +123,41 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute_receive {:dispatch_refresh_called, _}
   end
 
+  test "running and blocked issue reconciliation shares one tracker refresh" do
+    running_issue = %Issue{
+      id: "issue-running",
+      identifier: "A-RUNNING",
+      title: "Running",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    blocked_issue = %Issue{
+      id: "issue-blocked",
+      identifier: "A-BLOCKED",
+      title: "Blocked",
+      state: "Todo",
+      dispatchable: false
+    }
+
+    state = %Orchestrator.State{
+      running: %{running_issue.id => %{issue: running_issue}},
+      blocked: %{blocked_issue.id => %{issue: blocked_issue}}
+    }
+
+    fetcher = fn ids ->
+      send(self(), {:tracked_refresh_called, ids})
+      {:ok, [running_issue, blocked_issue]}
+    end
+
+    assert %Orchestrator.State{} =
+             Orchestrator.reconcile_tracked_issues_for_test(state, fetcher)
+
+    assert_receive {:tracked_refresh_called, ids}
+    assert MapSet.new(ids) == MapSet.new(["issue-running", "issue-blocked"])
+    refute_receive {:tracked_refresh_called, _}
+  end
+
   test "Linear rate-limit telemetry records sanitized request, endpoint, and complexity headers" do
     server = start_supervised!({RateLimit, name: Module.concat(__MODULE__, :TelemetryRateLimit)})
 
@@ -180,6 +215,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              )
 
     assert %{requests: %{limit: 1_500}} = RateLimit.snapshot(server)
+  end
+
+  test "Linear request quota paces orchestration polling across the reset window" do
+    telemetry = %{requests: %{remaining: 100, reset_at_ms: 1_060_000}}
+
+    assert RateLimit.recommended_poll_delay_for_test(telemetry, 1_000, 2, 1_000_000) ==
+             1_200
+
+    assert RateLimit.recommended_poll_delay_for_test(telemetry, 30_000, 2, 1_000_000) ==
+             30_000
+
+    assert RateLimit.recommended_poll_delay_for_test(telemetry, 30_000, 2, 1_100_000) ==
+             30_000
+
+    assert RateLimit.recommended_poll_delay_for_test(nil, 30_000, 2, 1_000_000) ==
+             30_000
   end
 
   test "workspace bootstrap can be implemented in after_create hook" do

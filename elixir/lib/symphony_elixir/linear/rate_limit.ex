@@ -57,6 +57,31 @@ defmodule SymphonyElixir.Linear.RateLimit do
     end
   end
 
+  @doc """
+  Spreads orchestration polls across the latest reported request quota window.
+
+  The request budget should include the expected number of tracker requests in
+  one poll cycle. When telemetry is unavailable or incomplete, the configured
+  interval is returned unchanged.
+  """
+  @spec recommended_poll_delay(non_neg_integer(), pos_integer(), GenServer.server()) ::
+          non_neg_integer()
+  def recommended_poll_delay(base_delay_ms, request_budget \\ 1, server \\ __MODULE__)
+      when is_integer(base_delay_ms) and base_delay_ms >= 0 and is_integer(request_budget) and
+             request_budget > 0 do
+    telemetry = snapshot(server)
+    recommended_poll_delay_for_telemetry(telemetry, base_delay_ms, request_budget, system_now_ms())
+  end
+
+  @doc false
+  @spec recommended_poll_delay_for_test(map() | nil, non_neg_integer(), pos_integer(), integer()) ::
+          non_neg_integer()
+  def recommended_poll_delay_for_test(telemetry, base_delay_ms, request_budget, now_ms)
+      when is_integer(base_delay_ms) and base_delay_ms >= 0 and is_integer(request_budget) and
+             request_budget > 0 and is_integer(now_ms) do
+    recommended_poll_delay_for_telemetry(telemetry, base_delay_ms, request_budget, now_ms)
+  end
+
   @doc false
   @spec reset(GenServer.server()) :: :ok
   def reset(server \\ __MODULE__) do
@@ -176,9 +201,39 @@ defmodule SymphonyElixir.Linear.RateLimit do
 
   defp telemetry_value(_value, _field), do: nil
 
+  defp recommended_poll_delay_for_telemetry(
+         %{requests: %{remaining: remaining, reset_at_ms: reset_at_ms}},
+         base_delay_ms,
+         request_budget,
+         now_ms
+       )
+       when is_integer(remaining) and remaining >= 0 and is_integer(reset_at_ms) do
+    window_ms = max(reset_at_ms - now_ms, 0)
+
+    quota_delay_ms =
+      if window_ms == 0 do
+        0
+      else
+        ceil_div(window_ms * request_budget, max(remaining, 1))
+      end
+
+    max(base_delay_ms, quota_delay_ms)
+  end
+
+  defp recommended_poll_delay_for_telemetry(
+         _telemetry,
+         base_delay_ms,
+         _request_budget,
+         _now_ms
+       ),
+       do: base_delay_ms
+
+  defp ceil_div(dividend, divisor), do: div(dividend + divisor - 1, divisor)
+
   defp available?(server) when is_pid(server), do: Process.alive?(server)
   defp available?(server) when is_atom(server), do: is_pid(Process.whereis(server))
   defp available?(_server), do: false
 
   defp now_ms, do: System.monotonic_time(:millisecond)
+  defp system_now_ms, do: System.system_time(:millisecond)
 end

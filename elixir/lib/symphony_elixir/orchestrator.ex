@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Linear.RateLimit
   alias SymphonyElixir.Tracker.Issue
 
   @failure_retry_base_ms 10_000
@@ -125,7 +126,8 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    poll_delay_ms = RateLimit.recommended_poll_delay(state.poll_interval_ms, 2)
+    state = schedule_tick(state, poll_delay_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
@@ -298,10 +300,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state =
-      state
-      |> reconcile_running_issues()
-      |> reconcile_blocked_issues()
+    state = reconcile_tracked_issues(state, &Tracker.fetch_issues_by_ids/1)
 
     with :ok <- Config.validate!(),
          {:ok, issues, state} <-
@@ -391,39 +390,33 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp reconcile_running_issues(%State{} = state) do
-    state = reconcile_stalled_running_issues(state)
-    running_ids = Map.keys(state.running)
-
-    if running_ids == [] do
-      state
-    else
-      case Tracker.fetch_issues_by_ids(running_ids) do
-        {:ok, issues} ->
-          issues
-          |> reconcile_running_issue_states(
-            state,
-            active_state_set(),
-            terminal_state_set()
-          )
-          |> reconcile_missing_running_issue_ids(running_ids, issues)
-
-        {:error, reason} ->
-          Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
-
-          state
-      end
-    end
+  @doc false
+  @spec reconcile_tracked_issues_for_test(term(), ([String.t()] -> term())) :: term()
+  def reconcile_tracked_issues_for_test(%State{} = state, fetcher)
+      when is_function(fetcher, 1) do
+    reconcile_tracked_issues(state, fetcher)
   end
 
-  defp reconcile_blocked_issues(%State{} = state) do
+  defp reconcile_tracked_issues(%State{} = state, fetcher) when is_function(fetcher, 1) do
+    state = reconcile_stalled_running_issues(state)
+    running_ids = Map.keys(state.running)
     blocked_ids = Map.keys(state.blocked)
+    tracked_ids = Enum.uniq(running_ids ++ blocked_ids)
 
-    if blocked_ids == [] do
+    if tracked_ids == [] do
       state
     else
-      case Tracker.fetch_issues_by_ids(blocked_ids) do
+      case fetcher.(tracked_ids) do
         {:ok, issues} ->
+          state =
+            issues
+            |> reconcile_running_issue_states(
+              state,
+              active_state_set(),
+              terminal_state_set()
+            )
+            |> reconcile_missing_running_issue_ids(running_ids, issues)
+
           issues
           |> reconcile_blocked_issue_states(
             state,
@@ -433,7 +426,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> reconcile_missing_blocked_issue_ids(blocked_ids, issues)
 
         {:error, reason} ->
-          Logger.debug("Failed to refresh blocked issue states: #{inspect(reason)}; keeping blocked issues")
+          Logger.debug("Failed to refresh running and blocked issue states: #{inspect(reason)}; keeping current sessions")
 
           state
       end
