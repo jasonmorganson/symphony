@@ -1039,6 +1039,143 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 10_500
   end
 
+  test "startup terminal workspace cleanup does not block the orchestrator" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    test_pid = self()
+    cleanup_supervisor = Module.concat(__MODULE__, :NonblockingCleanupTaskSupervisor)
+    orchestrator_name = Module.concat(__MODULE__, :NonblockingCleanupOrchestrator)
+    start_supervised!({Task.Supervisor, name: cleanup_supervisor})
+
+    cleanup_fun = fn ->
+      send(test_pid, :startup_cleanup_started)
+
+      receive do
+        :release_startup_cleanup -> :ok
+      end
+    end
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        task_supervisor: cleanup_supervisor,
+        terminal_workspace_cleanup_fun: cleanup_fun
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_receive :startup_cleanup_started
+    assert %{running: [], retrying: [], blocked: []} = Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    issue = %Issue{
+      id: "issue-cleanup-gated",
+      identifier: "MT-CLEANUP-GATED",
+      title: "Wait for startup cleanup",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    cleanup_state = :sys.get_state(pid)
+    assert is_reference(cleanup_state.startup_cleanup_ref)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, cleanup_state)
+
+    send(
+      pid,
+      {make_ref(), {make_ref(), :ok}}
+    )
+
+    assert is_reference(:sys.get_state(pid).startup_cleanup_ref)
+
+    cleanup_task =
+      cleanup_supervisor
+      |> Task.Supervisor.children()
+      |> List.first()
+
+    send(cleanup_task, :release_startup_cleanup)
+
+    wait_until(fn ->
+      state = :sys.get_state(pid)
+
+      is_nil(state.startup_cleanup_ref) and
+        Orchestrator.should_dispatch_issue_for_test(issue, state)
+    end)
+  end
+
+  test "startup cleanup failure clears its dispatch gate" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    cleanup_supervisor = Module.concat(__MODULE__, :FailedCleanupTaskSupervisor)
+    orchestrator_name = Module.concat(__MODULE__, :FailedCleanupOrchestrator)
+    start_supervised!({Task.Supervisor, name: cleanup_supervisor})
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        task_supervisor: cleanup_supervisor,
+        terminal_workspace_cleanup_fun: fn -> raise "cleanup failed" end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    wait_until(fn -> is_nil(:sys.get_state(pid).startup_cleanup_ref) end)
+    assert Process.alive?(pid)
+  end
+
+  test "orchestrator fails startup when its cleanup task cannot be supervised" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    assert {:error, {:startup_terminal_workspace_cleanup_start_failed, _reason}} =
+             Orchestrator.start_link(
+               name: Module.concat(__MODULE__, :MissingCleanupSupervisorOrchestrator),
+               task_supervisor: Module.concat(__MODULE__, :MissingCleanupTaskSupervisor),
+               terminal_workspace_cleanup_fun: fn -> :ok end
+             )
+
+    Process.flag(:trap_exit, previous_trap_exit)
+  end
+
+  test "an uncatchably killed startup cleanup task stops the orchestrator" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    test_pid = self()
+    cleanup_supervisor = Module.concat(__MODULE__, :KilledCleanupTaskSupervisor)
+    orchestrator_name = Module.concat(__MODULE__, :KilledCleanupOrchestrator)
+    start_supervised!({Task.Supervisor, name: cleanup_supervisor})
+
+    cleanup_fun = fn ->
+      send(test_pid, :killable_cleanup_started)
+      Process.sleep(:infinity)
+    end
+
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    {:ok, pid} =
+      Orchestrator.start_link(
+        name: orchestrator_name,
+        task_supervisor: cleanup_supervisor,
+        terminal_workspace_cleanup_fun: cleanup_fun
+      )
+
+    assert_receive :killable_cleanup_started
+    cleanup_task = cleanup_supervisor |> Task.Supervisor.children() |> List.first()
+    Process.exit(cleanup_task, :kill)
+
+    assert_receive {:EXIT, ^pid, {:startup_terminal_workspace_cleanup_task_down, :killed}}, 1_000
+    refute Process.alive?(pid)
+
+    Process.flag(:trap_exit, previous_trap_exit)
+  end
+
   test "rate-limit telemetry does not keep a stalled worker alive" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1926,6 +2063,24 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       else
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
+      end
+    end
+  end
+
+  defp wait_until(predicate, timeout_ms \\ 500) when is_function(predicate, 0) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until(predicate, deadline_ms)
+  end
+
+  defp do_wait_until(predicate, deadline_ms) do
+    if predicate.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        flunk("timed out waiting for condition")
+      else
+        Process.sleep(5)
+        do_wait_until(predicate, deadline_ms)
       end
     end
   end

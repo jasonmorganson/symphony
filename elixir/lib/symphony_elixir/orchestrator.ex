@@ -33,6 +33,8 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :startup_cleanup_ref,
+      :startup_cleanup_monitor_ref,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -62,26 +64,38 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, config} ->
         now_ms = System.monotonic_time(:millisecond)
         drain_state_path = Keyword.get(opts, :drain_state_path, config.worker.drain_state_path)
+        task_supervisor = Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor)
 
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-          configured_worker_hosts: config.worker.ssh_hosts,
-          drained_worker_hosts: load_drained_worker_hosts(drain_state_path, config.worker.ssh_hosts),
-          drain_state_path: drain_state_path,
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+        cleanup_ref = make_ref()
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+        cleanup_fun =
+          Keyword.get(opts, :terminal_workspace_cleanup_fun, &run_terminal_workspace_cleanup/0)
 
-        {:ok, state}
+        case start_terminal_workspace_cleanup(task_supervisor, cleanup_ref, cleanup_fun) do
+          {:ok, cleanup_task} ->
+            state = %State{
+              poll_interval_ms: config.polling.interval_ms,
+              max_concurrent_agents: config.agent.max_concurrent_agents,
+              next_poll_due_at_ms: now_ms,
+              poll_check_in_progress: false,
+              tick_timer_ref: nil,
+              tick_token: nil,
+              startup_cleanup_ref: cleanup_ref,
+              startup_cleanup_monitor_ref: cleanup_task.ref,
+              task_supervisor: task_supervisor,
+              configured_worker_hosts: config.worker.ssh_hosts,
+              drained_worker_hosts: load_drained_worker_hosts(drain_state_path, config.worker.ssh_hosts),
+              drain_state_path: drain_state_path,
+              codex_totals: @empty_codex_totals,
+              codex_rate_limits: nil
+            }
+
+            state = schedule_tick(state, 0)
+            {:ok, state}
+
+          {:error, reason} ->
+            {:stop, {:startup_terminal_workspace_cleanup_start_failed, reason}}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -133,6 +147,44 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info(
+        {monitor_ref, {cleanup_ref, result}},
+        %State{
+          startup_cleanup_ref: cleanup_ref,
+          startup_cleanup_monitor_ref: monitor_ref
+        } = state
+      ) do
+    Process.demonitor(monitor_ref, [:flush])
+
+    case result do
+      :ok ->
+        Logger.info("Startup terminal workspace cleanup completed")
+
+      {:error, reason} ->
+        Logger.warning("Startup terminal workspace cleanup failed: #{inspect(reason)}")
+    end
+
+    state =
+      state
+      |> Map.put(:startup_cleanup_ref, nil)
+      |> Map.put(:startup_cleanup_monitor_ref, nil)
+      |> schedule_tick(0)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({_monitor_ref, {_cleanup_ref, _result}}, state),
+    do: {:noreply, state}
+
+  def handle_info(
+        {:DOWN, monitor_ref, :process, _pid, reason},
+        %State{startup_cleanup_monitor_ref: monitor_ref} = state
+      ) do
+    Logger.error("Startup terminal workspace cleanup task exited before completion: #{inspect(reason)}")
+    {:stop, {:startup_terminal_workspace_cleanup_task_down, reason}, state}
   end
 
   def handle_info(
@@ -1650,6 +1702,32 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp start_terminal_workspace_cleanup(
+         task_supervisor,
+         cleanup_ref,
+         cleanup_fun
+       )
+       when is_function(cleanup_fun, 0) do
+    task =
+      Task.Supervisor.async_nolink(task_supervisor, fn ->
+        result =
+          try do
+            cleanup_fun.()
+            :ok
+          rescue
+            error -> {:error, {:exception, error, __STACKTRACE__}}
+          catch
+            kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+          end
+
+        {cleanup_ref, result}
+      end)
+
+    {:ok, task}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
@@ -1874,11 +1952,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp available_slots(%State{} = state) do
-    max(
-      (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
-        map_size(state.running),
+    if is_reference(state.startup_cleanup_ref) do
       0
-    )
+    else
+      max(
+        (state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents) -
+          map_size(state.running),
+        0
+      )
+    end
   end
 
   defp available_slots_for_new_work(%State{} = state) do
