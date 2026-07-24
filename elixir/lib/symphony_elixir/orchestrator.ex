@@ -363,7 +363,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp fetch_candidates(%State{} = state, fetcher) when is_function(fetcher, 1) do
-    if available_slots(state) > 0 do
+    if available_slots_for_new_work(state) > 0 do
       case fetcher.(Config.settings!().tracker.active_states) do
         {:ok, issues} when is_list(issues) ->
           {:ok, issues, cache_tracker_counts(state, issues)}
@@ -1015,7 +1015,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     cond do
-      available_slots(state) == 0 ->
+      available_slots_for_new_work(state) == 0 ->
         {Enum.reverse(selected), issues}
 
       should_dispatch_issue?(issue, state, active_states, terminal_states) ->
@@ -1260,7 +1260,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
-      available_slots(state) > 0 and
+      available_slots_for_new_work(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
   end
@@ -1850,6 +1850,27 @@ defmodule SymphonyElixir.Orchestrator do
       0
     )
   end
+
+  defp available_slots_for_new_work(%State{} = state) do
+    retry_reservation =
+      if Enum.any?(state.retry_attempts, fn {_issue_id, entry} -> valid_retry_entry?(entry) end),
+        do: 1,
+        else: 0
+
+    max(available_slots(state) - retry_reservation, 0)
+  end
+
+  defp valid_retry_entry?(%{
+         attempt: attempt,
+         timer_ref: timer_ref,
+         retry_token: retry_token,
+         due_at_ms: due_at_ms
+       })
+       when is_integer(attempt) and attempt > 0 and is_reference(timer_ref) and
+              is_reference(retry_token) and is_integer(due_at_ms),
+       do: true
+
+  defp valid_retry_entry?(_entry), do: false
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do

@@ -283,6 +283,9 @@ codex:
 - Dispatch order: by default, lower priority, older creation time, and identifier remain the
   ordering keys across all states. A workflow can set `agent.dispatch_state_order` to prioritize
   only listed states (for example, `["Merging"]`); normal ordering remains within each state rank.
+  While any valid retry entry is pending, one global slot is reserved as a retry lane, so newly
+  discovered work cannot repeatedly take the last slot while existing work backs off. Retry
+  dispatch itself uses that ordinary global slot after consuming its retry entry.
 
 ### GitHub Issues adapter
 

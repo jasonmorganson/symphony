@@ -810,6 +810,10 @@ ordering across all states.
 Global limit:
 
 - `available_slots = max(max_concurrent_agents - running_count, 0)`
+- While any structurally valid retry entry is pending, candidate polling and new dispatch SHOULD
+  reserve one global slot as a retry lane. Retry dispatch itself uses the ordinary global limit
+  after removing its retry entry, preventing new work from repeatedly taking the reserved capacity
+  without reserving one slot per backoff entry.
 
 Per-state limit:
 

@@ -559,6 +559,46 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(Orchestrator.snapshot(orchestrator_name, 1_000))
   end
 
+  test "new work preserves a dedicated slot while a valid retry is pending" do
+    issue = %Issue{
+      id: "new-candidate",
+      identifier: "MT-NEW",
+      title: "New candidate",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    running = %{
+      "running-issue" => %{
+        issue: %Issue{id: "running-issue", state: "In Progress"},
+        worker_host: nil
+      }
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 2,
+      poll_interval_ms: 30_000,
+      running: running,
+      retry_attempts: %{
+        "retrying-issue" => %{
+          attempt: 3,
+          timer_ref: make_ref(),
+          retry_token: make_ref(),
+          due_at_ms: System.monotonic_time(:millisecond) + 300_000
+        }
+      }
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    malformed_retry_state =
+      put_in(state.retry_attempts["retrying-issue"], %{
+        due_at_ms: System.monotonic_time(:millisecond) + 1_000
+      })
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, malformed_retry_state)
+  end
+
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_ids([])
   end
