@@ -800,15 +800,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    if Map.has_key?(running_entry, :last_meaningful_codex_timestamp) do
+      Map.get(running_entry, :last_meaningful_codex_timestamp) ||
+        Map.get(running_entry, :started_at)
+    else
+      Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    end
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+    meaningful_event =
+      Map.get(running_entry, :last_meaningful_codex_event, Map.get(running_entry, :last_codex_event))
+
+    meaningful_message =
+      Map.get(
+        running_entry,
+        :last_meaningful_codex_message,
+        Map.get(running_entry, :last_codex_message)
+      )
+
+    meaningful_event in [:turn_input_required, :approval_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
-      codex_message_method(Map.get(running_entry, :last_codex_message)) ==
+      codex_message_method(meaningful_message) ==
         "mcpServer/elicitation/request"
   end
 
@@ -837,9 +852,19 @@ defmodule SymphonyElixir.Orchestrator do
   defp normalize_input_required_outcome(_outcome), do: nil
 
   defp blocker_error(running_entry, fallback) when is_map(running_entry) do
-    codex_event_blocker_error(Map.get(running_entry, :last_codex_event)) ||
+    meaningful_event =
+      Map.get(running_entry, :last_meaningful_codex_event, Map.get(running_entry, :last_codex_event))
+
+    meaningful_message =
+      Map.get(
+        running_entry,
+        :last_meaningful_codex_message,
+        Map.get(running_entry, :last_codex_message)
+      )
+
+    codex_event_blocker_error(meaningful_event) ||
       completion_blocker_error(Map.get(running_entry, :completion)) ||
-      codex_message_blocker_error(Map.get(running_entry, :last_codex_message)) ||
+      codex_message_blocker_error(meaningful_message) ||
       fallback
   end
 
@@ -865,6 +890,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_message_method(%{message: %{"method" => method}}) when is_binary(method), do: method
   defp codex_message_method(%{message: %{method: method}}) when is_binary(method), do: method
+  defp codex_message_method(%{payload: %{"method" => method}}) when is_binary(method), do: method
+  defp codex_message_method(%{payload: %{method: method}}) when is_binary(method), do: method
   defp codex_message_method(%{"method" => method}) when is_binary(method), do: method
   defp codex_message_method(%{method: method}) when is_binary(method), do: method
   defp codex_message_method(_message), do: nil
@@ -1395,6 +1422,9 @@ defmodule SymphonyElixir.Orchestrator do
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
+            last_meaningful_codex_timestamp: nil,
+            last_meaningful_codex_message: nil,
+            last_meaningful_codex_event: nil,
             last_codex_event: nil,
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
@@ -2041,9 +2071,33 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
+    legacy_meaningful_timestamp =
+      Map.get(running_entry, :last_meaningful_codex_timestamp) ||
+        Map.get(running_entry, :last_codex_timestamp) ||
+        Map.get(running_entry, :started_at)
+
+    legacy_meaningful_message =
+      Map.get(
+        running_entry,
+        :last_meaningful_codex_message,
+        Map.get(running_entry, :last_codex_message)
+      )
+
+    legacy_meaningful_event =
+      Map.get(running_entry, :last_meaningful_codex_event, Map.get(running_entry, :last_codex_event))
+
+    meaningful_update? = meaningful_codex_update?(update, token_delta)
+
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
+        last_meaningful_codex_timestamp: if(meaningful_update?, do: timestamp, else: legacy_meaningful_timestamp),
+        last_meaningful_codex_message:
+          if(meaningful_update?,
+            do: summarize_codex_update(update),
+            else: legacy_meaningful_message
+          ),
+        last_meaningful_codex_event: if(meaningful_update?, do: event, else: legacy_meaningful_event),
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
@@ -2058,6 +2112,20 @@ defmodule SymphonyElixir.Orchestrator do
       }),
       token_delta
     }
+  end
+
+  defp meaningful_codex_update?(update, token_delta) do
+    case codex_message_method(update) do
+      "account/" <> _rest ->
+        false
+
+      "thread/tokenUsage/updated" ->
+        token_delta.input_tokens > 0 or token_delta.output_tokens > 0 or
+          token_delta.total_tokens > 0
+
+      _other ->
+        true
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
