@@ -767,8 +767,10 @@ until the shared cooldown expires.
 
 When a tracker reports a remaining request quota and reset window, the client SHOULD pace all
 callers through one process-wide admission boundary and retain a bounded reserve for recovery and
-operator actions. A caller rejected by admission MUST receive the same typed local rate-limit error
-without sending an upstream request.
+operator actions. Ordinary pacing SHOULD queue callers fairly rather than reject dependent
+requests within one logical operation. A caller rejected because a provider cooldown is active or
+the reserve has been reached MUST receive the same typed local rate-limit error without sending an
+upstream request.
 
 ### 8.2 Candidate Selection Rules
 

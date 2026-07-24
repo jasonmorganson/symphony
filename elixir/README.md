@@ -269,9 +269,12 @@ codex:
   requests per cycle across the remaining reset window; the configured interval remains the
   minimum. The same shared limiter paces every Linear request across the remaining window and
   reserves 10% of the hourly quota (at least 100 requests) instead of allowing concurrent agent
-  tools to exhaust it. Locally deferred request counts and the next admission delay are exposed
-  with the quota snapshot. The state API exposes the latest candidate observation as `tracker` with
-  `runnable_issues`, `blocked_issues`, and `observed_at`.
+  tools to exhaust it. Ordinary paced requests wait in one FIFO queue so multi-request operations
+  such as candidate discovery plus dispatch revalidation can finish without self-triggering a
+  synthetic rate-limit failure. Provider cooldowns and reserve exhaustion still fail locally with
+  the typed rate-limit error. Locally deferred and currently queued request counts plus the next
+  admission delay are exposed with the quota snapshot. The state API exposes the latest candidate
+  observation as `tracker` with `runnable_issues`, `blocked_issues`, and `observed_at`.
 
 ### GitHub Issues adapter
 

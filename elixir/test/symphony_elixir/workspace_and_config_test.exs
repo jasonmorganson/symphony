@@ -234,10 +234,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "Linear admission paces every request and preserves a quota reserve" do
-    {:ok, monotonic_clock} = Agent.start_link(fn -> 5_000 end)
-
     server =
-      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :PacingRateLimit), monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end, system_now_fun: fn -> 1_000_000 end})
+      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :PacingRateLimit), system_now_fun: fn -> 1_000_000 end})
 
     assert :ok =
              RateLimit.observe(
@@ -250,14 +248,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              )
 
     assert :ok = RateLimit.check(server)
-    assert {:error, {:linear_rate_limited, 34}} = RateLimit.check(server)
+    queued_check = Task.async(fn -> RateLimit.check(server) end)
+    assert nil == Task.yield(queued_check, 10)
 
     assert %{
-             admission: %{deferred_requests: 1, next_request_in_ms: 34}
+             admission: %{
+               deferred_requests: 1,
+               next_request_in_ms: next_request_in_ms,
+               queued_requests: 1
+             }
            } = RateLimit.snapshot(server)
 
-    Agent.update(monotonic_clock, &(&1 + 34))
-    assert :ok = RateLimit.check(server)
+    assert next_request_in_ms > 0
+    assert :ok = Task.await(queued_check, 200)
 
     reserve_server =
       start_supervised!(%{
@@ -267,7 +270,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            [
              [
                name: Module.concat(__MODULE__, :ReserveRateLimit),
-               monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end,
                system_now_fun: fn -> 1_000_000 end
              ]
            ]}
@@ -283,7 +285,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                reserve_server
              )
 
-    assert :ok = RateLimit.check(reserve_server)
+    assert {:error, {:linear_rate_limited, 60_000}} = RateLimit.check(reserve_server)
     assert {:error, {:linear_rate_limited, 60_000}} = RateLimit.check(reserve_server)
 
     reset_server =
@@ -294,7 +296,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            [
              [
                name: Module.concat(__MODULE__, :ResetWindowRateLimit),
-               monotonic_now_fun: fn -> Agent.get(monotonic_clock, & &1) end,
                system_now_fun: fn -> 1_060_000 end
              ]
            ]}
@@ -312,6 +313,170 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert :ok = RateLimit.check(reset_server)
     assert :ok = RateLimit.check(reset_server)
+  end
+
+  test "adjacent Linear candidate and dispatch revalidation requests wait for admission" do
+    rate_limit_name = Module.concat(__MODULE__, :QueuedDispatchRateLimit)
+
+    start_supervised!({RateLimit, name: rate_limit_name, system_now_fun: fn -> 1_000_000 end})
+
+    {:ok, request_count} = Agent.start_link(fn -> 0 end)
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "2059",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               rate_limit_name
+             )
+
+    request_fun = fn _payload, _headers ->
+      Agent.update(request_count, &(&1 + 1))
+
+      {:ok,
+       %{
+         status: 200,
+         headers: %{
+           "x-ratelimit-requests-limit" => "2500",
+           "x-ratelimit-requests-remaining" => "2059",
+           "x-ratelimit-requests-reset" => "1060000"
+         },
+         body: %{"data" => %{}}
+       }}
+    end
+
+    assert {:ok, %{"data" => %{}}} =
+             Client.graphql("query Candidates { issues { nodes { id } } }", %{},
+               request_fun: request_fun,
+               rate_limit_server: rate_limit_name
+             )
+
+    assert {:ok, %{"data" => %{}}} =
+             Client.graphql("query Revalidate { issues { nodes { id } } }", %{},
+               request_fun: request_fun,
+               rate_limit_server: rate_limit_name
+             )
+
+    assert Agent.get(request_count, & &1) == 2
+
+    assert %{
+             admission: %{deferred_requests: 1, queued_requests: 0}
+           } = RateLimit.snapshot(rate_limit_name)
+  end
+
+  test "Linear admission releases queued callers in FIFO order" do
+    server =
+      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :FifoRateLimit), system_now_fun: fn -> 1_000_000 end})
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "2059",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               server
+             )
+
+    assert :ok = RateLimit.check(server)
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        send(parent, {:admission_started, 1})
+        result = RateLimit.check(server)
+        send(parent, {:admission_released, 1})
+        result
+      end)
+
+    assert_receive {:admission_started, 1}
+    Process.sleep(5)
+
+    second =
+      Task.async(fn ->
+        send(parent, {:admission_started, 2})
+        result = RateLimit.check(server)
+        send(parent, {:admission_released, 2})
+        result
+      end)
+
+    assert_receive {:admission_started, 2}
+    Process.sleep(5)
+
+    assert %{admission: %{queued_requests: 2}} = RateLimit.snapshot(server)
+    send(server, {:release_waiter, make_ref()})
+    assert %{admission: %{queued_requests: 2}} = RateLimit.snapshot(server)
+
+    assert_receive {:admission_released, 1}, 200
+    refute_receive {:admission_released, 2}, 10
+    assert_receive {:admission_released, 2}, 200
+    assert :ok = Task.await(first)
+    assert :ok = Task.await(second)
+  end
+
+  test "Linear admission flushes queued callers on cooldown and reserve exhaustion" do
+    cooldown_server =
+      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :QueuedCooldownRateLimit), system_now_fun: fn -> 1_000_000 end})
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "2059",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               cooldown_server
+             )
+
+    assert :ok = RateLimit.check(cooldown_server)
+    cooldown_waiter = Task.async(fn -> RateLimit.check(cooldown_server) end)
+    Process.sleep(5)
+    assert %{admission: %{queued_requests: 1}} = RateLimit.snapshot(cooldown_server)
+    assert :ok = RateLimit.activate(1_000, cooldown_server)
+
+    assert {:error, {:linear_rate_limited, remaining_ms}} = Task.await(cooldown_waiter)
+    assert remaining_ms > 0
+
+    reserve_server =
+      start_supervised!(%{
+        id: :queued_reserve_rate_limit,
+        start:
+          {RateLimit, :start_link,
+           [
+             [
+               name: Module.concat(__MODULE__, :QueuedReserveRateLimit),
+               system_now_fun: fn -> 1_000_000 end
+             ]
+           ]}
+      })
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "2059",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               reserve_server
+             )
+
+    assert :ok = RateLimit.check(reserve_server)
+    reserve_waiter = Task.async(fn -> RateLimit.check(reserve_server) end)
+    Process.sleep(5)
+
+    assert :ok =
+             RateLimit.observe(
+               %{
+                 "x-ratelimit-requests-limit" => "2500",
+                 "x-ratelimit-requests-remaining" => "250",
+                 "x-ratelimit-requests-reset" => "1060000"
+               },
+               reserve_server
+             )
+
+    assert {:error, {:linear_rate_limited, 60_000}} = Task.await(reserve_waiter, 200)
   end
 
   test "workspace bootstrap can be implemented in after_create hook" do
