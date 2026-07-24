@@ -23,7 +23,7 @@ defmodule SymphonyElixir.Linear.RateLimit do
   @spec check(GenServer.server()) :: :ok | {:error, error()}
   def check(server \\ __MODULE__) do
     if available?(server) do
-      GenServer.call(server, :check)
+      GenServer.call(server, :check, :infinity)
     else
       :ok
     end
@@ -101,13 +101,15 @@ defmodule SymphonyElixir.Linear.RateLimit do
        deferred_requests: 0,
        monotonic_now_fun: Keyword.get(opts, :monotonic_now_fun, fn -> System.monotonic_time(:millisecond) end),
        next_request_at_ms: nil,
+       pacing_timer_ref: nil,
        system_now_fun: Keyword.get(opts, :system_now_fun, fn -> System.system_time(:millisecond) end),
-       telemetry: nil
+       telemetry: nil,
+       waiters: :queue.new()
      }}
   end
 
   @impl true
-  def handle_call(:check, _from, state) do
+  def handle_call(:check, from, state) do
     monotonic_now_ms = state.monotonic_now_fun.()
 
     cooldown_remaining_ms =
@@ -116,20 +118,31 @@ defmodule SymphonyElixir.Linear.RateLimit do
     pacing_remaining_ms =
       max((state.next_request_at_ms || monotonic_now_ms) - monotonic_now_ms, 0)
 
-    remaining_ms = max(cooldown_remaining_ms, pacing_remaining_ms)
+    reserve_remaining_ms =
+      reserve_cooldown_remaining(state.telemetry, state.system_now_fun.())
 
-    if remaining_ms > 0 do
-      state = %{state | deferred_requests: state.deferred_requests + 1}
-      {:reply, {:error, {:linear_rate_limited, remaining_ms}}, state}
-    else
-      pacing_delay_ms = request_pacing_delay(state.telemetry, state.system_now_fun.())
+    cond do
+      cooldown_remaining_ms > 0 ->
+        state = Map.update!(state, :deferred_requests, &(&1 + 1))
+        {:reply, {:error, {:linear_rate_limited, cooldown_remaining_ms}}, state}
 
-      {:reply, :ok,
-       %{
-         state
-         | cooldown_until_ms: nil,
-           next_request_at_ms: monotonic_now_ms + pacing_delay_ms
-       }}
+      reserve_remaining_ms > 0 ->
+        state = Map.update!(state, :deferred_requests, &(&1 + 1))
+        {:reply, {:error, {:linear_rate_limited, reserve_remaining_ms}}, state}
+
+      :queue.is_empty(state.waiters) and pacing_remaining_ms == 0 ->
+        {:reply, :ok, admit_request(state, monotonic_now_ms)}
+
+      true ->
+        waiters = :queue.in(from, state.waiters)
+
+        state =
+          state
+          |> Map.put(:waiters, waiters)
+          |> Map.update!(:deferred_requests, &(&1 + 1))
+          |> schedule_pacing_timer(pacing_remaining_ms)
+
+        {:noreply, state}
     end
   end
 
@@ -139,7 +152,14 @@ defmodule SymphonyElixir.Linear.RateLimit do
     cooldown_until_ms =
       max(state.cooldown_until_ms || monotonic_now_ms, monotonic_now_ms + retry_after_ms)
 
-    {:reply, :ok, %{state | cooldown_until_ms: cooldown_until_ms}}
+    remaining_ms = max(cooldown_until_ms - monotonic_now_ms, 0)
+
+    state =
+      state
+      |> flush_waiters({:error, {:linear_rate_limited, remaining_ms}})
+      |> Map.put(:cooldown_until_ms, cooldown_until_ms)
+
+    {:reply, :ok, state}
   end
 
   def handle_call(:snapshot, _from, state) do
@@ -149,7 +169,8 @@ defmodule SymphonyElixir.Linear.RateLimit do
       if is_map(state.telemetry) do
         Map.put(state.telemetry, :admission, %{
           deferred_requests: state.deferred_requests,
-          next_request_in_ms: max((state.next_request_at_ms || monotonic_now_ms) - monotonic_now_ms, 0)
+          next_request_in_ms: max((state.next_request_at_ms || monotonic_now_ms) - monotonic_now_ms, 0),
+          queued_requests: :queue.len(state.waiters)
         })
       end
 
@@ -157,6 +178,8 @@ defmodule SymphonyElixir.Linear.RateLimit do
   end
 
   def handle_call(:reset, _from, state) do
+    state = flush_waiters(state, :ok)
+
     {:reply, :ok,
      %{
        state
@@ -171,6 +194,102 @@ defmodule SymphonyElixir.Linear.RateLimit do
   def handle_cast({:observe, telemetry}, state) do
     {:noreply, %{state | telemetry: telemetry}}
   end
+
+  @impl true
+  def handle_info(
+        {:release_waiter, token},
+        %{pacing_timer_ref: {_timer_ref, token}} = state
+      ) do
+    state = %{state | pacing_timer_ref: nil}
+    monotonic_now_ms = state.monotonic_now_fun.()
+
+    reserve_remaining_ms =
+      reserve_cooldown_remaining(state.telemetry, state.system_now_fun.())
+
+    pacing_remaining_ms =
+      max((state.next_request_at_ms || monotonic_now_ms) - monotonic_now_ms, 0)
+
+    cond do
+      reserve_remaining_ms > 0 ->
+        state =
+          flush_waiters(
+            state,
+            {:error, {:linear_rate_limited, reserve_remaining_ms}}
+          )
+
+        {:noreply, state}
+
+      pacing_remaining_ms > 0 ->
+        {:noreply, schedule_pacing_timer(state, pacing_remaining_ms)}
+
+      true ->
+        release_next_waiter(state, monotonic_now_ms)
+    end
+  end
+
+  def handle_info({:release_waiter, _token}, state), do: {:noreply, state}
+
+  defp release_next_waiter(state, monotonic_now_ms) do
+    {{:value, from}, waiters} = :queue.out(state.waiters)
+    GenServer.reply(from, :ok)
+    state = %{admit_request(state, monotonic_now_ms) | waiters: waiters}
+    pacing_remaining_ms = max(state.next_request_at_ms - monotonic_now_ms, 0)
+    {:noreply, schedule_pacing_timer(state, pacing_remaining_ms)}
+  end
+
+  defp admit_request(state, monotonic_now_ms) do
+    pacing_delay_ms = request_pacing_delay(state.telemetry, state.system_now_fun.())
+
+    %{
+      state
+      | cooldown_until_ms: nil,
+        next_request_at_ms: monotonic_now_ms + pacing_delay_ms
+    }
+  end
+
+  defp schedule_pacing_timer(%{pacing_timer_ref: {timer_ref, _token}} = state, _delay_ms)
+       when is_reference(timer_ref),
+       do: state
+
+  defp schedule_pacing_timer(state, delay_ms) do
+    if :queue.is_empty(state.waiters) do
+      state
+    else
+      token = make_ref()
+      timer_ref = Process.send_after(self(), {:release_waiter, token}, max(delay_ms, 0))
+      %{state | pacing_timer_ref: {timer_ref, token}}
+    end
+  end
+
+  defp flush_waiters(state, reply) do
+    case state.pacing_timer_ref do
+      {timer_ref, _token} when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+      _other -> :ok
+    end
+
+    state.waiters
+    |> :queue.to_list()
+    |> Enum.each(&GenServer.reply(&1, reply))
+
+    %{state | pacing_timer_ref: nil, waiters: :queue.new()}
+  end
+
+  defp reserve_cooldown_remaining(
+         %{requests: %{limit: limit, remaining: remaining, reset_at_ms: reset_at_ms}},
+         now_ms
+       )
+       when is_integer(limit) and limit > 0 and is_integer(remaining) and remaining >= 0 and
+              is_integer(reset_at_ms) do
+    reserve = max(div(limit, 10), 100)
+
+    if remaining <= reserve do
+      max(reset_at_ms - now_ms, 0)
+    else
+      0
+    end
+  end
+
+  defp reserve_cooldown_remaining(_telemetry, _now_ms), do: 0
 
   defp rate_limit_telemetry(headers) do
     telemetry =
