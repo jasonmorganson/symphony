@@ -1301,6 +1301,483 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
   end
 
+  test "orchestrator preserves priority ordering across states by default" do
+    todo = %Issue{
+      id: "issue-todo",
+      identifier: "MT-300",
+      title: "Urgent todo",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2025-01-01 00:00:00Z]
+    }
+
+    in_progress_newer = %Issue{
+      id: "issue-progress-new",
+      identifier: "MT-302",
+      title: "Newer in progress",
+      state: "In Progress",
+      priority: 2,
+      created_at: ~U[2026-01-02 00:00:00Z]
+    }
+
+    in_progress_older = %Issue{
+      id: "issue-progress-old",
+      identifier: "MT-301",
+      title: "Older in progress",
+      state: "In Progress",
+      priority: 2,
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    sorted =
+      Orchestrator.sort_issues_for_dispatch_for_test([
+        todo,
+        in_progress_newer,
+        in_progress_older
+      ])
+
+    assert Enum.map(sorted, & &1.identifier) == ["MT-300", "MT-301", "MT-302"]
+  end
+
+  test "configured dispatch state order prioritizes Merging and preserves order within it" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Merging"],
+      dispatch_state_order: ["Merging"]
+    )
+
+    todo = %Issue{
+      id: "issue-todo",
+      identifier: "MT-400",
+      title: "Urgent todo",
+      state: "Todo",
+      priority: 1,
+      created_at: ~U[2025-01-01 00:00:00Z]
+    }
+
+    merging_newer = %Issue{
+      id: "issue-merging-new",
+      identifier: "MT-402",
+      title: "Newer merging",
+      state: "Merging",
+      priority: 2,
+      created_at: ~U[2026-01-02 00:00:00Z]
+    }
+
+    merging_older = %Issue{
+      id: "issue-merging-old",
+      identifier: "MT-401",
+      title: "Older merging",
+      state: "Merging",
+      priority: 2,
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    sorted =
+      Orchestrator.sort_issues_for_dispatch_for_test([
+        todo,
+        merging_newer,
+        merging_older
+      ])
+
+    assert Enum.map(sorted, & &1.identifier) == ["MT-401", "MT-402", "MT-400"]
+  end
+
+  test "pending projection reuses the last candidate observation and explains capacity" do
+    running = %Issue{
+      id: "issue-running",
+      identifier: "MT-RUNNING",
+      title: "Running",
+      state: "In Progress",
+      dispatchable: true
+    }
+
+    pending = %Issue{
+      id: "issue-pending",
+      identifier: "MT-PENDING",
+      title: "Pending",
+      state: "Todo",
+      priority: 2,
+      url: "https://example.org/issues/MT-PENDING",
+      dispatchable: true
+    }
+
+    observed_at = ~U[2026-07-24 12:00:00Z]
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{running.id => %{issue: running}},
+      claimed: MapSet.new([running.id]),
+      tracker_counts: %{runnable_issues: 2, blocked_issues: 0, observed_at: observed_at}
+    }
+
+    updated =
+      Orchestrator.cache_pending_candidates_for_test(state, [running, pending])
+
+    assert updated.pending_candidates == %{
+             observed_at: observed_at,
+             issues: [
+               %{
+                 issue_id: "issue-pending",
+                 identifier: "MT-PENDING",
+                 issue_url: "https://example.org/issues/MT-PENDING",
+                 state: "Todo",
+                 priority: 2,
+                 reason: "orchestrator capacity full",
+                 refresh_status: "observed"
+               }
+             ]
+           }
+  end
+
+  test "pending projection removes a candidate refreshed into a terminal state" do
+    candidate = %Issue{
+      id: "issue-terminal",
+      identifier: "MT-TERMINAL",
+      title: "Terminal",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{max_concurrent_agents: 1}
+      |> Orchestrator.cache_pending_candidates_for_test([candidate])
+
+    terminal = %{candidate | state: "Done"}
+
+    assert {:ok, []} =
+             Orchestrator.revalidate_dispatch_candidates_for_test([candidate], fn _ids ->
+               {:ok, [terminal]}
+             end)
+
+    updated =
+      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
+        state,
+        [candidate],
+        []
+      )
+
+    assert updated.pending_candidates.issues == []
+  end
+
+  test "pending projection removes a candidate missing during dispatch refresh" do
+    candidate = %Issue{
+      id: "issue-missing",
+      identifier: "MT-MISSING",
+      title: "Missing",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{max_concurrent_agents: 1}
+      |> Orchestrator.cache_pending_candidates_for_test([candidate])
+
+    assert {:ok, []} =
+             Orchestrator.revalidate_dispatch_candidates_for_test([candidate], fn _ids ->
+               {:ok, []}
+             end)
+
+    updated =
+      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
+        state,
+        [candidate],
+        []
+      )
+
+    assert updated.pending_candidates.issues == []
+  end
+
+  test "pending projection uses refreshed state and fields" do
+    candidate = %Issue{
+      id: "issue-state-change",
+      identifier: "MT-OLD",
+      title: "Old title",
+      state: "Todo",
+      priority: 3,
+      dispatchable: true
+    }
+
+    running = %Issue{
+      id: "issue-running-capacity",
+      identifier: "MT-RUNNING",
+      title: "Running",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{
+        max_concurrent_agents: 1,
+        running: %{running.id => %{issue: running}},
+        claimed: MapSet.new([running.id])
+      }
+      |> Orchestrator.cache_pending_candidates_for_test([candidate])
+
+    refreshed = %{
+      candidate
+      | identifier: "MT-REFRESHED",
+        title: "Refreshed title",
+        state: "In Progress",
+        priority: 1,
+        url: "https://example.org/issues/MT-REFRESHED"
+    }
+
+    updated =
+      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
+        state,
+        [candidate],
+        [refreshed]
+      )
+
+    assert [
+             %{
+               issue_id: "issue-state-change",
+               identifier: "MT-REFRESHED",
+               issue_url: "https://example.org/issues/MT-REFRESHED",
+               state: "In Progress",
+               priority: 1,
+               reason: "orchestrator capacity full",
+               refresh_status: "refreshed"
+             }
+           ] = updated.pending_candidates.issues
+  end
+
+  test "pending projection recomputes retained reasons after filling global capacity" do
+    selected = %Issue{
+      id: "issue-selected-global",
+      identifier: "MT-SELECTED-GLOBAL",
+      title: "Selected",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    retained = %Issue{
+      id: "issue-retained-global",
+      identifier: "MT-RETAINED-GLOBAL",
+      title: "Retained",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{
+        max_concurrent_agents: 1,
+        running: %{selected.id => %{issue: selected}},
+        claimed: MapSet.new([selected.id])
+      }
+      |> Orchestrator.cache_pending_candidates_for_test([selected, retained])
+
+    updated =
+      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
+        state,
+        [selected],
+        [selected]
+      )
+
+    assert [%{issue_id: "issue-retained-global", reason: "orchestrator capacity full"}] =
+             updated.pending_candidates.issues
+  end
+
+  test "pending projection recomputes retained reasons after filling state capacity" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_concurrent_agents: 2,
+      max_concurrent_agents_by_state: %{"Todo" => 1}
+    )
+
+    selected = %Issue{
+      id: "issue-selected-state",
+      identifier: "MT-SELECTED-STATE",
+      title: "Selected",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    retained = %Issue{
+      id: "issue-retained-state",
+      identifier: "MT-RETAINED-STATE",
+      title: "Retained",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{
+        max_concurrent_agents: 2,
+        running: %{selected.id => %{issue: selected}},
+        claimed: MapSet.new([selected.id])
+      }
+      |> Orchestrator.cache_pending_candidates_for_test([selected, retained])
+
+    updated =
+      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
+        state,
+        [selected],
+        [selected]
+      )
+
+    assert [%{issue_id: "issue-retained-state", reason: "state concurrency limit reached"}] =
+             updated.pending_candidates.issues
+  end
+
+  test "pending projection marks every candidate skipped by a refresh error as stale" do
+    selected = %Issue{
+      id: "issue-refresh-error",
+      identifier: "MT-REFRESH-ERROR",
+      title: "Refresh error",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    skipped = %Issue{
+      id: "issue-refresh-skipped",
+      identifier: "MT-REFRESH-SKIPPED",
+      title: "Skipped after refresh error",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{max_concurrent_agents: 1}
+      |> Orchestrator.cache_pending_candidates_for_test([selected, skipped])
+
+    updated =
+      Orchestrator.mark_pending_refresh_failed_for_test(
+        state,
+        [selected],
+        [skipped],
+        :tracker_unavailable
+      )
+
+    assert Enum.map(updated.pending_candidates.issues, & &1.issue_id) ==
+             ["issue-refresh-error", "issue-refresh-skipped"]
+
+    assert Enum.all?(updated.pending_candidates.issues, fn entry ->
+             entry.refresh_status == "failed" and
+               entry.reason == "dispatch refresh failed: :tracker_unavailable"
+           end)
+  end
+
+  test "pending projection preserves capacity reasons outside an aborted refresh batch" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Merging"],
+      max_concurrent_agents: 2,
+      max_concurrent_agents_by_state: %{"Merging" => 1}
+    )
+
+    running_merging = %Issue{
+      id: "issue-running-merging",
+      identifier: "MT-RUNNING-MERGING",
+      title: "Running merging",
+      state: "Merging",
+      dispatchable: true
+    }
+
+    blocked_merging = %Issue{
+      id: "issue-blocked-merging",
+      identifier: "MT-BLOCKED-MERGING",
+      title: "Blocked by state capacity",
+      state: "Merging",
+      dispatchable: true
+    }
+
+    selected_todo = %Issue{
+      id: "issue-selected-todo",
+      identifier: "MT-SELECTED-TODO",
+      title: "Selected todo",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{
+        max_concurrent_agents: 2,
+        running: %{running_merging.id => %{issue: running_merging}},
+        claimed: MapSet.new([running_merging.id])
+      }
+      |> Orchestrator.cache_pending_candidates_for_test([blocked_merging, selected_todo])
+
+    updated =
+      Orchestrator.mark_pending_refresh_failed_for_test(
+        state,
+        [selected_todo],
+        [],
+        :tracker_unavailable
+      )
+
+    assert [
+             %{
+               issue_id: "issue-blocked-merging",
+               reason: "state concurrency limit reached",
+               refresh_status: "observed"
+             },
+             %{
+               issue_id: "issue-selected-todo",
+               reason: "dispatch refresh failed: :tracker_unavailable",
+               refresh_status: "failed"
+             }
+           ] = updated.pending_candidates.issues
+  end
+
+  test "pending projection preserves capacity reasons for aborted remaining candidates" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Merging"],
+      max_concurrent_agents: 2,
+      max_concurrent_agents_by_state: %{"Merging" => 1}
+    )
+
+    running_merging = %Issue{
+      id: "issue-running-merging-remaining",
+      identifier: "MT-RUNNING-MERGING-REMAINING",
+      title: "Running merging",
+      state: "Merging",
+      dispatchable: true
+    }
+
+    selected_todo = %Issue{
+      id: "issue-selected-todo-remaining",
+      identifier: "MT-SELECTED-TODO-REMAINING",
+      title: "Selected todo",
+      state: "Todo",
+      dispatchable: true
+    }
+
+    remaining_merging = %Issue{
+      id: "issue-blocked-merging-remaining",
+      identifier: "MT-BLOCKED-MERGING-REMAINING",
+      title: "Blocked merging in remaining",
+      state: "Merging",
+      dispatchable: true
+    }
+
+    state =
+      %Orchestrator.State{
+        max_concurrent_agents: 2,
+        running: %{running_merging.id => %{issue: running_merging}},
+        claimed: MapSet.new([running_merging.id])
+      }
+      |> Orchestrator.cache_pending_candidates_for_test([selected_todo, remaining_merging])
+
+    updated =
+      Orchestrator.mark_pending_refresh_failed_for_test(
+        state,
+        [selected_todo],
+        [remaining_merging],
+        :tracker_unavailable
+      )
+
+    entries = Map.new(updated.pending_candidates.issues, &{&1.issue_id, &1})
+
+    assert %{
+             reason: "dispatch refresh failed: :tracker_unavailable",
+             refresh_status: "failed"
+           } = entries["issue-selected-todo-remaining"]
+
+    assert %{
+             reason: "state concurrency limit reached",
+             refresh_status: "observed"
+           } = entries["issue-blocked-merging-remaining"]
+  end
+
   test "provider-marked blocked issue is not dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,
@@ -1931,6 +2408,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), worker_drain_state_path: "$SYMPHONY_TEST_DRAIN_PATH")
     assert :ok = Config.validate!()
     assert Config.settings!().worker.drain_state_path == nil
+  end
+
+  test "config validates and ranks explicit dispatch state order" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      dispatch_state_order: [" Merging ", "Human Review"]
+    )
+
+    assert Config.settings!().agent.dispatch_state_order == ["merging", "human review"]
+    assert Config.dispatch_state_rank("Merging") == 0
+    assert Config.dispatch_state_rank("Human Review") == 1
+    assert Config.dispatch_state_rank("Todo") == 2
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      dispatch_state_order: ["Merging", " merging "]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.dispatch_state_order"
+
+    write_workflow_file!(Workflow.workflow_file_path(), dispatch_state_order: [""])
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.dispatch_state_order"
   end
 
   test "schema helpers cover custom type and state limit validation" do

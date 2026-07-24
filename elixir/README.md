@@ -172,6 +172,9 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - `agent.continuation_delay_ms_by_state` throttles clean-exit re-entry for selected active states.
   State names are normalized like `max_concurrent_agents_by_state`; unlisted states use `1000` ms.
+- `agent.dispatch_state_order` optionally lists state names in dispatch-preference order. State
+  names are normalized and must be unique and non-blank. The default empty list preserves normal
+  priority, creation-time, and identifier ordering across states.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -274,7 +277,12 @@ codex:
   synthetic rate-limit failure. Provider cooldowns and reserve exhaustion still fail locally with
   the typed rate-limit error. Locally deferred and currently queued request counts plus the next
   admission delay are exposed with the quota snapshot. The state API exposes the latest candidate
-  observation as `tracker` with `runnable_issues`, `blocked_issues`, and `observed_at`.
+  observation as `tracker` with `runnable_issues`, `blocked_issues`, and `observed_at`. It also
+  projects eligible candidates that were not assigned from that same fetch as `pending`, including
+  the observation time and capacity reason; this projection performs no additional tracker read.
+- Dispatch order: by default, lower priority, older creation time, and identifier remain the
+  ordering keys across all states. A workflow can set `agent.dispatch_state_order` to prioritize
+  only listed states (for example, `["Merging"]`); normal ordering remains within each state rank.
 
 ### GitHub Issues adapter
 
@@ -330,6 +338,7 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+- Pending eligible work shows the last observed unassigned candidates and why each is waiting
 
 ## Project Layout
 

@@ -16,11 +16,13 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            pending: snapshot |> pending_issues() |> length()
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          pending: pending_payload(Map.get(snapshot, :pending)),
           worker_pool: snapshot.worker_pool,
           tracker: Map.get(snapshot, :tracker),
           codex_totals: snapshot.codex_totals,
@@ -161,6 +163,34 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
+    }
+  end
+
+  defp pending_payload(%{observed_at: observed_at, issues: issues}) when is_list(issues) do
+    %{
+      observed_at: iso8601(observed_at),
+      issues: Enum.map(issues, &pending_entry_payload/1)
+    }
+  end
+
+  defp pending_payload(_pending), do: %{observed_at: nil, issues: []}
+
+  defp pending_issues(snapshot) do
+    case Map.get(snapshot, :pending) do
+      %{issues: issues} when is_list(issues) -> issues
+      _ -> []
+    end
+  end
+
+  defp pending_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      issue_url: Map.get(entry, :issue_url),
+      state: entry.state,
+      priority: Map.get(entry, :priority),
+      reason: entry.reason,
+      refresh_status: Map.get(entry, :refresh_status, "observed")
     }
   end
 

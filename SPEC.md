@@ -463,6 +463,10 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Blank state names and non-positive or non-integer values invalidate the
     workflow configuration.
+- `dispatch_state_order` (list of state names, OPTIONAL extension)
+  - Default: empty list.
+  - When non-empty, listed states are ranked in list order before unlisted states.
+  - State names are normalized and MUST be unique and non-blank.
 
 #### 5.3.6 `codex` (object)
 
@@ -629,6 +633,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `agent.continuation_delay_ms_by_state`: map of positive integers, default `{}`; states not present use `1000`
+- `agent.dispatch_state_order`: optional ordered list of preferred states, default `[]`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -791,9 +796,14 @@ checked separately by the surrounding algorithm.
 
 Sorting order (stable intent):
 
-1. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
-2. `created_at` oldest first; null sorts last
-3. `identifier` lexicographic tie-breaker
+1. Optional configured state rank when the implementation exposes `agent.dispatch_state_order`;
+   unlisted states share the rank after listed states
+2. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
+3. `created_at` oldest first; null sorts last
+4. `identifier` lexicographic tie-breaker
+
+With the default empty state order, this is the standard priority, creation-time, and identifier
+ordering across all states.
 
 ### 8.3 Concurrency Control
 
@@ -1416,6 +1426,9 @@ SHOULD return:
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
+- `pending` (the last candidate observation timestamp plus eligible-but-unassigned issue rows and
+  their capacity reason); implementations SHOULD derive it from the candidate fetch already used
+  for dispatch rather than add a tracker request
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`
   - `input_tokens`
@@ -2157,7 +2170,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order is priority then oldest creation time
+- Dispatch sort order is priority then oldest creation time by default; an optional explicit state
+  preference ranks only configured states first
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
