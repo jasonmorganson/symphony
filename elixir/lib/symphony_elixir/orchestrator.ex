@@ -43,6 +43,7 @@ defmodule SymphonyElixir.Orchestrator do
       drained_worker_hosts: MapSet.new(),
       drain_state_path: nil,
       tracker_counts: nil,
+      pending_candidates: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -496,6 +497,36 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec cache_pending_candidates_for_test(term(), [Issue.t()]) :: term()
+  def cache_pending_candidates_for_test(%State{} = state, issues) when is_list(issues) do
+    cache_pending_candidates(state, issues, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_pending_candidates_after_refresh_for_test(term(), [Issue.t()], [Issue.t()]) :: term()
+  def reconcile_pending_candidates_after_refresh_for_test(
+        %State{} = state,
+        selected,
+        refreshed
+      )
+      when is_list(selected) and is_list(refreshed) do
+    reconcile_pending_candidates_after_refresh(
+      state,
+      selected,
+      refreshed,
+      active_state_set(),
+      terminal_state_set()
+    )
+  end
+
+  @doc false
+  @spec mark_pending_refresh_failed_for_test(term(), [Issue.t()], [Issue.t()], term()) :: term()
+  def mark_pending_refresh_failed_for_test(%State{} = state, selected, remaining, reason)
+      when is_list(selected) and is_list(remaining) do
+    mark_pending_refresh_failed(state, selected, remaining, reason)
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     state =
@@ -900,6 +931,8 @@ defmodule SymphonyElixir.Orchestrator do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
 
+    state = cache_pending_candidates(state, issues, active_states, terminal_states)
+
     issues
     |> sort_issues_for_dispatch()
     |> dispatch_candidate_batches(state, active_states, terminal_states)
@@ -930,11 +963,24 @@ defmodule SymphonyElixir.Orchestrator do
             active_states,
             terminal_states
           )
+          |> reconcile_pending_candidates_after_refresh(
+            selected,
+            refreshed_issues,
+            active_states,
+            terminal_states
+          )
 
         dispatch_candidate_batches(remaining, updated_state, active_states, terminal_states)
 
       {:error, reason} ->
-        dispatch_revalidated_candidates({:error, reason}, state, active_states, terminal_states)
+        failed_state = mark_pending_refresh_failed(state, selected, remaining, reason)
+
+        dispatch_revalidated_candidates(
+          {:error, reason},
+          failed_state,
+          active_states,
+          terminal_states
+        )
     end
   end
 
@@ -1046,11 +1092,152 @@ defmodule SymphonyElixir.Orchestrator do
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
       %Issue{} = issue ->
-        {priority_rank(issue.priority), issue_created_at_sort_key(issue), issue.identifier || issue.id || ""}
+        {
+          Config.dispatch_state_rank(issue.state),
+          priority_rank(issue.priority),
+          issue_created_at_sort_key(issue),
+          issue.identifier || issue.id || ""
+        }
 
       _ ->
-        {priority_rank(nil), issue_created_at_sort_key(nil), ""}
+        {1, priority_rank(nil), issue_created_at_sort_key(nil), ""}
     end)
+  end
+
+  defp cache_pending_candidates(state, issues, active_states, terminal_states) do
+    observed_at =
+      case state.tracker_counts do
+        %{observed_at: %DateTime{} = observed_at} -> observed_at
+        _ -> DateTime.utc_now()
+      end
+
+    pending =
+      issues
+      |> sort_issues_for_dispatch()
+      |> Enum.flat_map(fn
+        %Issue{} = issue ->
+          if pending_candidate?(issue, state, active_states, terminal_states) do
+            [
+              %{
+                issue_id: issue.id,
+                identifier: issue.identifier,
+                issue_url: issue.url,
+                state: issue.state,
+                priority: issue.priority,
+                reason: pending_candidate_reason(issue, state),
+                refresh_status: "observed"
+              }
+            ]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end)
+
+    %{state | pending_candidates: %{observed_at: observed_at, issues: pending}}
+  end
+
+  defp reconcile_pending_candidates_after_refresh(
+         state,
+         selected,
+         refreshed,
+         active_states,
+         terminal_states
+       ) do
+    selected_ids = MapSet.new(selected, & &1.id)
+
+    retained =
+      state
+      |> pending_candidate_issues()
+      |> Enum.reject(&MapSet.member?(selected_ids, &1.issue_id))
+
+    refreshed_pending =
+      Enum.flat_map(refreshed, fn issue ->
+        if pending_candidate?(issue, state, active_states, terminal_states) do
+          [
+            %{
+              issue_id: issue.id,
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              state: issue.state,
+              priority: issue.priority,
+              reason: pending_candidate_reason(issue, state),
+              refresh_status: "refreshed"
+            }
+          ]
+        else
+          []
+        end
+      end)
+
+    pending =
+      Enum.map(retained ++ refreshed_pending, fn entry ->
+        %{entry | reason: pending_entry_reason(entry, state)}
+      end)
+
+    put_pending_candidate_issues(state, pending)
+  end
+
+  defp mark_pending_refresh_failed(state, selected, remaining, reason) do
+    aborted_ids = MapSet.new(selected ++ remaining, & &1.id)
+
+    updated =
+      Enum.map(pending_candidate_issues(state), fn entry ->
+        current_reason = pending_entry_reason(entry, state)
+
+        if MapSet.member?(aborted_ids, entry.issue_id) and
+             current_reason == "awaiting next dispatch cycle" do
+          %{
+            entry
+            | reason: "dispatch refresh failed: #{inspect(reason)}",
+              refresh_status: "failed"
+          }
+        else
+          %{entry | reason: current_reason}
+        end
+      end)
+
+    put_pending_candidate_issues(state, updated)
+  end
+
+  defp pending_entry_reason(%{state: issue_state}, state) do
+    pending_candidate_reason(%Issue{state: issue_state}, state)
+  end
+
+  defp pending_candidate_issues(%State{pending_candidates: %{issues: issues}})
+       when is_list(issues),
+       do: issues
+
+  defp pending_candidate_issues(_state), do: []
+
+  defp put_pending_candidate_issues(
+         %State{pending_candidates: %{observed_at: observed_at}} = state,
+         issues
+       )
+       when is_list(issues) do
+    %{state | pending_candidates: %{observed_at: observed_at, issues: issues}}
+  end
+
+  defp put_pending_candidate_issues(state, issues) when is_list(issues) do
+    %{state | pending_candidates: %{observed_at: DateTime.utc_now(), issues: issues}}
+  end
+
+  defp pending_candidate?(issue, state, active_states, terminal_states) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(state.claimed, issue.id) and
+      !Map.has_key?(state.running, issue.id) and
+      !Map.has_key?(state.blocked, issue.id)
+  end
+
+  defp pending_candidate_reason(issue, state) do
+    cond do
+      available_slots(state) == 0 -> "orchestrator capacity full"
+      !state_slots_available?(issue, state.running) -> "state concurrency limit reached"
+      !worker_slots_available?(state) -> "no worker capacity"
+      true -> "awaiting next dispatch cycle"
+    end
   end
 
   defp priority_rank(priority) when is_integer(priority) and priority in 1..4, do: priority
@@ -1769,6 +1956,7 @@ defmodule SymphonyElixir.Orchestrator do
          drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort()
        },
        tracker: state.tracker_counts,
+       pending: state.pending_candidates,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{

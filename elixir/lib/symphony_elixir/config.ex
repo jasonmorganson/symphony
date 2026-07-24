@@ -68,6 +68,18 @@ defmodule SymphonyElixir.Config do
 
   def continuation_delay_ms_for_state(_state_name), do: 1_000
 
+  @spec dispatch_state_rank(term()) :: non_neg_integer()
+  def dispatch_state_rank(state_name) when is_binary(state_name) do
+    order = settings!().agent.dispatch_state_order
+
+    case Enum.find_index(order, &(&1 == Schema.normalize_issue_state(state_name))) do
+      nil -> length(order)
+      rank -> rank
+    end
+  end
+
+  def dispatch_state_rank(_state_name), do: length(settings!().agent.dispatch_state_order)
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

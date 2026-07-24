@@ -99,6 +99,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Pending</p>
+            <p class="metric-value numeric"><%= @payload.counts.pending %></p>
+            <p class="metric-detail">Last observed eligible issues waiting for capacity.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -111,6 +117,51 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Pending eligible work</h2>
+              <p class="section-copy">
+                Last observed eligible issues not yet assigned to a worker.
+                Observed at <span class="mono"><%= @payload.pending.observed_at || "n/a" %></span>.
+              </p>
+            </div>
+          </div>
+
+          <%= if @payload.pending.issues == [] do %>
+            <p class="empty-state">No eligible issues were waiting in the last candidate poll.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 680px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Priority</th>
+                    <th>Observation</th>
+                    <th>Why pending</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.pending.issues}>
+                    <td>
+                      <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.state)}>
+                        <%= entry.state %>
+                      </span>
+                    </td>
+                    <td><%= entry.priority || "n/a" %></td>
+                    <td><%= entry.refresh_status %></td>
+                    <td><%= entry.reason %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">

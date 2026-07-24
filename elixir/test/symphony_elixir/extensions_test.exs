@@ -277,7 +277,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "pending" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -323,6 +323,20 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "pending" => %{
+               "observed_at" => "2026-07-23T16:00:00Z",
+               "issues" => [
+                 %{
+                   "issue_id" => "issue-pending",
+                   "issue_identifier" => "MT-PENDING",
+                   "issue_url" => "https://example.org/issues/MT-PENDING",
+                   "state" => "Merging",
+                   "priority" => 1,
+                   "reason" => "state concurrency limit reached",
+                   "refresh_status" => "observed"
+                 }
+               ]
+             },
              "worker_pool" => %{
                "configured_hosts" => ["worker-a", "worker-b"],
                "drained_hosts" => []
@@ -551,6 +565,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
+    assert html =~ "MT-PENDING"
+    assert html =~ "Pending eligible work"
+    assert html =~ "state concurrency limit reached"
+    assert html =~ "Observed at"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
@@ -660,7 +678,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "blocked" => 1,
+             "pending" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -752,6 +776,20 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
+      pending: %{
+        observed_at: ~U[2026-07-23 16:00:00Z],
+        issues: [
+          %{
+            issue_id: "issue-pending",
+            identifier: "MT-PENDING",
+            issue_url: "https://example.org/issues/MT-PENDING",
+            state: "Merging",
+            priority: 1,
+            reason: "state concurrency limit reached",
+            refresh_status: "observed"
+          }
+        ]
+      },
       worker_pool: %{configured_hosts: ["worker-a", "worker-b"], drained_hosts: []},
       tracker: %{
         runnable_issues: 5,
