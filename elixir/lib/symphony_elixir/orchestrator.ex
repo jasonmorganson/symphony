@@ -47,7 +47,8 @@ defmodule SymphonyElixir.Orchestrator do
       tracker_counts: nil,
       pending_candidates: nil,
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      merge_writer_lease: nil
     ]
   end
 
@@ -774,6 +775,8 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
         end
 
+        state = release_merge_writer_for_issue(state, issue_id)
+
         %{
           state
           | running: Map.delete(state.running, issue_id),
@@ -1004,6 +1007,8 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_event: Map.get(running_entry, :last_codex_event),
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
     }
+
+    state = release_merge_writer_for_issue(state, issue_id)
 
     %{
       state
@@ -2117,6 +2122,18 @@ defmodule SymphonyElixir.Orchestrator do
     GenServer.call(server, {:resume_issues, issues, reason}, timeout)
   end
 
+  @spec acquire_merge_writer(GenServer.server(), Issue.t(), timeout()) ::
+          {:ok, map()} | {:error, term()}
+  def acquire_merge_writer(server, %Issue{} = issue, timeout \\ 15_000) do
+    GenServer.call(server, {:acquire_merge_writer, issue}, timeout)
+  end
+
+  @spec release_merge_writer(GenServer.server(), Issue.t(), timeout()) ::
+          {:ok, map()} | {:error, term()}
+  def release_merge_writer(server, %Issue{} = issue, timeout \\ 15_000) do
+    GenServer.call(server, {:release_merge_writer, issue}, timeout)
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2194,6 +2211,7 @@ defmodule SymphonyElixir.Orchestrator do
        },
        tracker: state.tracker_counts,
        pending: state.pending_candidates,
+       merge_writer: state.merge_writer_lease,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -2254,6 +2272,58 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:acquire_merge_writer, %Issue{} = issue}, _from, state) do
+    case acquire_merge_writer_lease(state, issue) do
+      {:ok, updated_state, lease} -> {:reply, {:ok, lease}, updated_state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:release_merge_writer, %Issue{} = issue}, _from, state) do
+    case state.merge_writer_lease do
+      %{issue_id: issue_id} when issue_id == issue.id ->
+        {:reply, {:ok, %{released: true}}, %{state | merge_writer_lease: nil}}
+
+      nil ->
+        {:reply, {:ok, %{released: false}}, state}
+
+      %{identifier: identifier} ->
+        {:reply, {:error, {:merge_writer_owned_by, identifier}}, state}
+    end
+  end
+
+  defp acquire_merge_writer_lease(%State{} = state, %Issue{} = issue) do
+    cond do
+      !running_merging_issue?(state, issue.id) ->
+        {:error, :issue_not_running_in_merging}
+
+      is_nil(state.merge_writer_lease) ->
+        lease = %{
+          issue_id: issue.id,
+          identifier: issue.identifier,
+          acquired_at: DateTime.utc_now()
+        }
+
+        {:ok, %{state | merge_writer_lease: lease}, Map.put(lease, :acquired, true)}
+
+      state.merge_writer_lease.issue_id == issue.id ->
+        {:ok, state, Map.put(state.merge_writer_lease, :acquired, true)}
+
+      true ->
+        {:error, {:merge_writer_busy, state.merge_writer_lease.identifier}}
+    end
+  end
+
+  defp running_merging_issue?(%State{} = state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{issue: %Issue{state: issue_state}} when is_binary(issue_state) ->
+        String.downcase(String.trim(issue_state)) == "merging"
+
+      _ ->
+        false
+    end
   end
 
   defp resume_issue(
@@ -2442,8 +2512,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp pop_running_entry(state, issue_id) do
+    state = release_merge_writer_for_issue(state, issue_id)
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
+
+  defp release_merge_writer_for_issue(
+         %State{merge_writer_lease: %{issue_id: issue_id}} = state,
+         issue_id
+       ),
+       do: %{state | merge_writer_lease: nil}
+
+  defp release_merge_writer_for_issue(state, _issue_id), do: state
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())

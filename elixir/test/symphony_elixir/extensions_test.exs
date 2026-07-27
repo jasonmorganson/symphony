@@ -357,6 +357,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  }
                ]
              },
+             "merge_writer" => nil,
              "worker_pool" => %{
                "configured_hosts" => ["worker-a", "worker-b"],
                "drained_hosts" => [],

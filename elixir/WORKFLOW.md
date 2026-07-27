@@ -32,6 +32,8 @@ agent:
   max_turns: 20
   continuation_delay_ms_by_state:
     Merging: 60000
+  max_concurrent_agents_by_state:
+    Merging: 3
   dispatch_state_order:
     - Merging
   dispatch_priority_labels:
@@ -135,9 +137,10 @@ only on an external asynchronous event such as GitHub checks, deployment verific
 1. Query the external system once and record the exact identity being awaited (PR/head SHA, check
    run or deployment ID, and current terminal/non-terminal status) in the workpad.
 2. Persist every local change, workpad update, and validation result needed for a later continuation.
-3. End the current invocation cleanly without changing the Linear state and without sleeping,
-   repeatedly polling, or treating the wait as a failure. A clean exit releases the authenticated
-   Codex worker; Symphony schedules a continuation for the still-active issue.
+3. Call `symphony_merge_writer` with `{"action":"yield"}` and then end the turn without changing
+   the Linear state, sleeping, repeatedly polling, or treating the wait as a failure. The explicit
+   yield stops Symphony's normal back-to-back Codex continuation, releases any writer lease and the
+   authenticated worker, and schedules a later continuation for the still-active issue.
 4. On continuation, re-query once. If the event is still non-terminal, update its observation time
    only when useful and yield cleanly again. If it is terminal, resume the matching workflow gate.
 
@@ -184,6 +187,8 @@ rerun needed to prove a new fix. Query those authoritative external gates for th
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
 - `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
+- `symphony_merge_writer`: acquire Symphony's singleton final-writer lease immediately before the
+  irreversible merge write and release it immediately after landing or before yielding.
 
 ## Status map
 
@@ -329,6 +334,15 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+   - Preparation is parallel: sync the branch, resolve conflicts, address review, validate, and
+     observe external checks without holding the final-writer lease.
+   - Once every final prerequisite is satisfied, call `symphony_merge_writer` with
+     `{"action":"acquire"}`. If it reports another owner, use the external-wait checkpoint protocol.
+   - After acquiring, revalidate the exact PR head, current base, approval, and required checks,
+     then execute the land skill's irreversible merge step.
+   - Call `symphony_merge_writer` with `{"action":"release"}` immediately after landing. If any
+     prerequisite becomes non-terminal or actionable repair is needed, release before continuing or
+     yielding. Process exit also releases the lease, but explicit release is required.
 6. During the land loop, use the external-wait checkpoint protocol whenever checks or deployment
    verification are non-terminal. Do not occupy the serialized Merging worker by polling.
 7. If exact-main or post-merge verification fails:

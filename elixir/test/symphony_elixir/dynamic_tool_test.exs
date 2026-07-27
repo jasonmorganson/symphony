@@ -3,6 +3,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool, as: BoundDynamicTool
   alias SymphonyElixir.Linear.AgentTool, as: DynamicTool
+  alias SymphonyElixir.{MergeWriterTool, Orchestrator}
+  alias SymphonyElixir.Tracker.Issue
 
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
@@ -53,7 +55,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+
+    assert Enum.map(BoundDynamicTool.bind().tool_specs, & &1["name"]) == [
+             "symphony_merge_writer"
+           ]
 
     test_pid = self()
 
@@ -73,6 +78,125 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert tracker_settings.api_key == "session-token"
     assert tracker_settings.project_slug == "session-project"
     assert response["success"] == true
+  end
+
+  test "bound tools always advertise the merge writer lease" do
+    binding = BoundDynamicTool.bind()
+
+    assert Enum.any?(binding.tool_specs, fn spec ->
+             spec["name"] == "symphony_merge_writer" and
+               spec["inputSchema"]["properties"]["action"]["enum"] == [
+                 "acquire",
+                 "release",
+                 "yield"
+               ]
+           end)
+  end
+
+  test "yield action releases continuation back to the orchestrator" do
+    orchestrator_name =
+      Module.concat(__MODULE__, "YieldOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      MergeWriterTool.take_yield_request()
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    response =
+      MergeWriterTool.execute(
+        %{"action" => "yield"},
+        issue: %Issue{id: "yield-1", identifier: "MT-YIELD", state: "Merging"},
+        merge_writer_server: pid
+      )
+
+    assert response["success"]
+
+    assert Jason.decode!(response["output"]) == %{
+             "released" => false,
+             "yield_after_turn" => true
+           }
+
+    assert MergeWriterTool.take_yield_request()
+    refute MergeWriterTool.take_yield_request()
+  end
+
+  test "merge writer tool acquires, rejects competitors, releases, and validates actions" do
+    orchestrator_name =
+      Module.concat(__MODULE__, "LeaseToolOrchestrator#{System.unique_integer([:positive])}")
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    first = %Issue{id: "tool-merge-1", identifier: "MT-TOOL-1", state: "Merging"}
+    second = %Issue{id: "tool-merge-2", identifier: "MT-TOOL-2", state: "Merging"}
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | startup_cleanup_ref: nil,
+          startup_cleanup_monitor_ref: nil,
+          running: %{
+            first.id => %{issue: first},
+            second.id => %{issue: second}
+          }
+      }
+    end)
+
+    on_exit(fn ->
+      MergeWriterTool.take_yield_request()
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    assert %{"success" => true} =
+             MergeWriterTool.execute(
+               %{"action" => "acquire"},
+               issue: first,
+               merge_writer_server: pid
+             )
+
+    assert %{"success" => false, "output" => busy_output} =
+             MergeWriterTool.execute(
+               %{"action" => "acquire"},
+               issue: second,
+               merge_writer_server: pid
+             )
+
+    assert Jason.decode!(busy_output)["error"] =~ "merge_writer_busy"
+
+    assert %{"success" => false, "output" => yield_output} =
+             MergeWriterTool.execute(
+               %{"action" => "yield"},
+               issue: second,
+               merge_writer_server: pid
+             )
+
+    assert Jason.decode!(yield_output)["error"] =~ "merge_writer_owned_by"
+    refute MergeWriterTool.take_yield_request()
+
+    assert %{"success" => true} =
+             MergeWriterTool.execute(
+               %{"action" => "release"},
+               issue: first,
+               merge_writer_server: pid
+             )
+
+    assert %{"success" => false, "output" => invalid_output} =
+             MergeWriterTool.execute(
+               %{"action" => "invalid"},
+               issue: first,
+               merge_writer_server: pid
+             )
+
+    assert Jason.decode!(invalid_output) == %{"error" => ":invalid_action"}
+
+    assert %{"success" => false, "output" => context_output} =
+             MergeWriterTool.execute(
+               %{"action" => "acquire"},
+               issue: %{},
+               merge_writer_server: pid
+             )
+
+    assert Jason.decode!(context_output) == %{"error" => ":missing_issue_context"}
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do
