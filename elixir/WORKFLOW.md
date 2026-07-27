@@ -47,7 +47,9 @@ Follow-up context:
 - This is follow-up attempt #{{ attempt }}. It may be a normal continuation or a retry after a failure.
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
-- Do not end the turn while the work item remains in an active state unless you are blocked by missing required access.
+- Do not hold a Codex worker merely to wait for an external system. Follow the external-wait
+  checkpoint protocol below; Symphony will resume the active issue after its configured
+  continuation delay.
   {% endif %}
 
 Issue context:
@@ -95,6 +97,23 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
+
+## External-wait checkpoint protocol
+
+Use this protocol when all currently actionable repository work is complete and progress depends
+only on an external asynchronous event such as GitHub checks, deployment verification, or a review:
+
+1. Query the external system once and record the exact identity being awaited (PR/head SHA, check
+   run or deployment ID, and current terminal/non-terminal status) in the workpad.
+2. Persist every local change, workpad update, and validation result needed for a later continuation.
+3. End the current invocation cleanly without changing the Linear state and without sleeping,
+   repeatedly polling, or treating the wait as a failure. A clean exit releases the authenticated
+   Codex worker; Symphony schedules a continuation for the still-active issue.
+4. On continuation, re-query once. If the event is still non-terminal, update its observation time
+   only when useful and yield cleanly again. If it is terminal, resume the matching workflow gate.
+
+Never use this protocol while an actionable diff, conflict, reviewer comment, or deterministic
+failure remains. Those require work in the current invocation.
 
 ## Related skills
 
@@ -248,7 +267,17 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+6. During the land loop, use the external-wait checkpoint protocol whenever checks or deployment
+   verification are non-terminal. Do not occupy the serialized Merging worker by polling.
+7. If exact-main or post-merge verification fails:
+   - First prove whether the failure is attributable to this issue's merged diff.
+   - If attributable, repair it in this issue.
+   - If the same failure is proven to predate this merge and an active owner repair issue exists,
+     record the failing run and owner identifier in the workpad, leave this issue in `Merging`, and
+     yield cleanly. Do not duplicate the repair, falsely mark this issue `Done`, or poll while the
+     owner repair competes for capacity. Repair-priority dispatch allows that owner to run before
+     ordinary Merging continuations.
+8. After merge and all issue-owned post-merge gates are complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
 
