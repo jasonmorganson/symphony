@@ -1181,13 +1181,14 @@ defmodule SymphonyElixir.Orchestrator do
       %Issue{} = issue ->
         {
           Config.dispatch_state_rank(issue.state),
+          Config.dispatch_label_rank(issue.labels),
           priority_rank(issue.priority),
           issue_created_at_sort_key(issue),
           issue.identifier || issue.id || ""
         }
 
       _ ->
-        {1, priority_rank(nil), issue_created_at_sort_key(nil), ""}
+        {1, 1, priority_rank(nil), issue_created_at_sort_key(nil), ""}
     end)
   end
 
@@ -2153,23 +2154,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = refresh_runtime_config(state)
 
     {resumed, skipped, updated_state} =
-      Enum.reduce(issues, {[], [], state}, fn
-        %Issue{state: "Human Review"} = issue, {resumed, skipped, state_acc} ->
-          if resume_dispatch_available?(issue, state_acc) do
-            next_state = do_dispatch_issue(state_acc, issue, nil, nil, operator_resume_reason: reason)
-
-            if Map.has_key?(next_state.running, issue.id) do
-              {[issue.identifier | resumed], skipped, next_state}
-            else
-              {resumed, [%{identifier: issue.identifier, reason: "no_worker_capacity"} | skipped], next_state}
-            end
-          else
-            {resumed, [%{identifier: issue.identifier, reason: "capacity_or_claim_unavailable"} | skipped], state_acc}
-          end
-
-        %Issue{} = issue, {resumed, skipped, state_acc} ->
-          {resumed, [%{identifier: issue.identifier, reason: "not_in_human_review"} | skipped], state_acc}
-      end)
+      Enum.reduce(issues, {[], [], state}, &resume_issue(&1, &2, reason))
 
     {:reply,
      {:ok,
@@ -2193,6 +2178,36 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp resume_issue(
+         %Issue{state: "Human Review"} = issue,
+         {resumed, skipped, state},
+         reason
+       ) do
+    if resume_dispatch_available?(issue, state) do
+      record_resume_dispatch(issue, resumed, skipped, state, reason)
+    else
+      skip_resume(issue, resumed, skipped, state, "capacity_or_claim_unavailable")
+    end
+  end
+
+  defp resume_issue(%Issue{} = issue, {resumed, skipped, state}, _reason) do
+    skip_resume(issue, resumed, skipped, state, "not_in_human_review")
+  end
+
+  defp record_resume_dispatch(issue, resumed, skipped, state, reason) do
+    next_state = do_dispatch_issue(state, issue, nil, nil, operator_resume_reason: reason)
+
+    if Map.has_key?(next_state.running, issue.id) do
+      {[issue.identifier | resumed], skipped, next_state}
+    else
+      skip_resume(issue, resumed, skipped, next_state, "no_worker_capacity")
+    end
+  end
+
+  defp skip_resume(issue, resumed, skipped, state, reason) do
+    {resumed, [%{identifier: issue.identifier, reason: reason} | skipped], state}
   end
 
   defp resume_dispatch_available?(%Issue{} = issue, %State{} = state) do

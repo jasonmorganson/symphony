@@ -175,6 +175,11 @@ Notes:
 - `agent.dispatch_state_order` optionally lists state names in dispatch-preference order. State
   names are normalized and must be unique and non-blank. The default empty list preserves normal
   priority, creation-time, and identifier ordering across states.
+- `agent.dispatch_priority_labels` optionally lists issue labels in dispatch-preference order.
+  Labels are matched case-insensitively after trimming. The first matching configured label ranks
+  ahead of tracker priority and age within the same state rank. Use this for narrowly scoped
+  shared-gate repairs such as `production-gate` and `main-ci`, not as a replacement for ordinary
+  tracker priority.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -282,7 +287,9 @@ codex:
   the observation time and capacity reason; this projection performs no additional tracker read.
 - Dispatch order: by default, lower priority, older creation time, and identifier remain the
   ordering keys across all states. A workflow can set `agent.dispatch_state_order` to prioritize
-  only listed states (for example, `["Merging"]`); normal ordering remains within each state rank.
+  only listed states (for example, `["Merging"]`). Within each state rank, configured
+  `agent.dispatch_priority_labels` are considered before tracker priority, creation time, and
+  identifier.
   While any valid retry entry is pending, one global slot is reserved as a retry lane, so newly
   discovered work cannot repeatedly take the last slot while existing work backs off. Retry
   dispatch itself uses that ordinary global slot after consuming its retry entry.
