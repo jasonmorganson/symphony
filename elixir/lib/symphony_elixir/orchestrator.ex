@@ -634,6 +634,9 @@ defmodule SymphonyElixir.Orchestrator do
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
+      operator_resume_human_review?(state, issue) ->
+        refresh_running_issue_state(state, issue)
+
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
@@ -642,6 +645,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp operator_resume_human_review?(state, %Issue{id: issue_id, state: issue_state}) do
+    normalize_issue_state(issue_state) == "human review" and
+      get_in(state.running, [issue_id, :operator_resume]) == true
+  end
 
   defp reconcile_blocked_issue_states([], state, _active_states, _terminal_states), do: state
 
@@ -1498,6 +1506,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            operator_resume: Keyword.has_key?(agent_opts, :operator_resume_reason),
             started_at: DateTime.utc_now()
           })
 
@@ -2148,7 +2157,12 @@ defmodule SymphonyElixir.Orchestrator do
         %Issue{state: "Human Review"} = issue, {resumed, skipped, state_acc} ->
           if resume_dispatch_available?(issue, state_acc) do
             next_state = do_dispatch_issue(state_acc, issue, nil, nil, operator_resume_reason: reason)
-            {[issue.identifier | resumed], skipped, next_state}
+
+            if Map.has_key?(next_state.running, issue.id) do
+              {[issue.identifier | resumed], skipped, next_state}
+            else
+              {resumed, [%{identifier: issue.identifier, reason: "no_worker_capacity"} | skipped], next_state}
+            end
           else
             {resumed, [%{identifier: issue.identifier, reason: "capacity_or_claim_unavailable"} | skipped], state_acc}
           end

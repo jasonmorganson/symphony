@@ -928,6 +928,57 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "reconcile preserves an operator-resumed Human Review issue" do
+    issue_id = "issue-operator-resume"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-560",
+          operator_resume: true,
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-560",
+            state: "Human Review",
+            dispatchable: true
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-560",
+      state: "Human Review",
+      title: "Operator resumed issue",
+      description: "The workflow still owns this passive-state session",
+      labels: [],
+      dispatchable: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert updated_state.running[issue_id].issue.state == "Human Review"
+    assert Process.alive?(agent_pid)
+
+    send(agent_pid, :stop)
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
