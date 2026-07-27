@@ -147,6 +147,12 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
+    assert prompt =~ "Exact-state validation evidence"
+    assert prompt =~ "`head_sha`"
+    assert prompt =~ "`main_sha`"
+    assert prompt =~ "`config_digest`"
+    assert prompt =~ "working tree is clean"
+    assert prompt =~ "never replaces required GitHub"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do

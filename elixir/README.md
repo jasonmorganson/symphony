@@ -51,6 +51,9 @@ tracker issue can become a dispatch candidate again after restart.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
+   - The bundled workflow reuses successful local validation only when the PR head SHA, fetched
+     default-branch SHA, and validation configuration digest all match. Required GitHub, review,
+     deployment, and post-merge gates remain authoritative.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
