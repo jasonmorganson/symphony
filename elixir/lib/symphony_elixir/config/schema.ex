@@ -156,6 +156,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents_by_state, :map, default: %{})
       field(:continuation_delay_ms_by_state, :map, default: %{})
       field(:dispatch_state_order, {:array, :string}, default: [])
+      field(:dispatch_priority_labels, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -169,7 +170,8 @@ defmodule SymphonyElixir.Config.Schema do
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state,
           :continuation_delay_ms_by_state,
-          :dispatch_state_order
+          :dispatch_state_order,
+          :dispatch_priority_labels
         ],
         empty_values: []
       )
@@ -182,6 +184,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> Schema.validate_state_limits(:continuation_delay_ms_by_state)
       |> update_change(:dispatch_state_order, &Schema.normalize_state_order/1)
       |> Schema.validate_state_order(:dispatch_state_order)
+      |> update_change(:dispatch_priority_labels, &Schema.normalize_state_order/1)
+      |> Schema.validate_state_order(:dispatch_priority_labels)
     end
   end
 

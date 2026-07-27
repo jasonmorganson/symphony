@@ -80,6 +80,19 @@ defmodule SymphonyElixir.Config do
 
   def dispatch_state_rank(_state_name), do: length(settings!().agent.dispatch_state_order)
 
+  @spec dispatch_label_rank([String.t()]) :: non_neg_integer()
+  def dispatch_label_rank(labels) when is_list(labels) do
+    order = settings!().agent.dispatch_priority_labels
+    normalized_labels = MapSet.new(labels, &Schema.normalize_issue_state/1)
+
+    case Enum.find_index(order, &MapSet.member?(normalized_labels, &1)) do
+      nil -> length(order)
+      rank -> rank
+    end
+  end
+
+  def dispatch_label_rank(_labels), do: length(settings!().agent.dispatch_priority_labels)
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

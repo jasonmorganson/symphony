@@ -1382,6 +1382,46 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(sorted, & &1.identifier) == ["MT-401", "MT-402", "MT-400"]
   end
 
+  test "configured priority labels advance gate repairs within the same state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Merging"],
+      dispatch_state_order: ["Merging"],
+      dispatch_priority_labels: ["production-gate", "main-ci"]
+    )
+
+    ordinary = %Issue{
+      id: "ordinary",
+      identifier: "MT-500",
+      state: "Merging",
+      priority: 1,
+      labels: [],
+      created_at: ~U[2025-01-01 00:00:00Z]
+    }
+
+    main_ci = %Issue{
+      id: "main-ci",
+      identifier: "MT-502",
+      state: "Merging",
+      priority: 1,
+      labels: ["Main-CI"],
+      created_at: ~U[2026-01-01 00:00:00Z]
+    }
+
+    production_gate = %Issue{
+      id: "production-gate",
+      identifier: "MT-501",
+      state: "Merging",
+      priority: 4,
+      labels: ["production-gate"],
+      created_at: ~U[2026-01-02 00:00:00Z]
+    }
+
+    sorted =
+      Orchestrator.sort_issues_for_dispatch_for_test([ordinary, main_ci, production_gate])
+
+    assert Enum.map(sorted, & &1.identifier) == ["MT-501", "MT-502", "MT-500"]
+  end
+
   test "pending projection reuses the last candidate observation and explains capacity" do
     running = %Issue{
       id: "issue-running",

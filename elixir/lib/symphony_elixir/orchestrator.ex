@@ -1181,13 +1181,14 @@ defmodule SymphonyElixir.Orchestrator do
       %Issue{} = issue ->
         {
           Config.dispatch_state_rank(issue.state),
+          Config.dispatch_label_rank(issue.labels),
           priority_rank(issue.priority),
           issue_created_at_sort_key(issue),
           issue.identifier || issue.id || ""
         }
 
       _ ->
-        {1, priority_rank(nil), issue_created_at_sort_key(nil), ""}
+        {1, 1, priority_rank(nil), issue_created_at_sort_key(nil), ""}
     end)
   end
 
