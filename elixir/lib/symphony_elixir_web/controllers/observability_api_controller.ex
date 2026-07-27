@@ -6,7 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
-  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.{Orchestrator, Tracker}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -49,9 +49,68 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec operator_resume(Conn.t(), map()) :: Conn.t()
+  def operator_resume(
+        conn,
+        %{"issue_identifiers" => identifiers, "reason" => reason}
+      )
+      when is_list(identifiers) and is_binary(reason) do
+    with true <- operator_action_authorized?(conn),
+         {:ok, normalized_identifiers} <- normalize_resume_identifiers(identifiers),
+         {:ok, normalized_reason} <- normalize_resume_reason(reason),
+         {:ok, human_review_issues} <- Tracker.fetch_issues_by_states(["Human Review"]),
+         {:ok, selected_issues} <-
+           select_resume_issues(human_review_issues, normalized_identifiers),
+         {:ok, payload} <-
+           Orchestrator.resume_issues(
+             orchestrator(),
+             selected_issues,
+             normalized_reason,
+             snapshot_timeout_ms()
+           ) do
+      conn
+      |> put_status(202)
+      |> json(payload)
+    else
+      false ->
+        error_response(conn, 401, "unauthorized", "Valid operator authorization is required")
+
+      {:error, :invalid_issue_identifiers} ->
+        error_response(
+          conn,
+          422,
+          "invalid_issue_identifiers",
+          "issue_identifiers must contain 1 to 10 unique tracker identifiers"
+        )
+
+      {:error, :invalid_reason} ->
+        error_response(conn, 422, "invalid_reason", "reason must contain 1 to 500 characters")
+
+      {:error, {:issues_not_in_human_review, _missing}} ->
+        error_response(
+          conn,
+          409,
+          "issues_not_in_human_review",
+          "Every requested issue must currently be in Human Review"
+        )
+
+      {:error, _reason} ->
+        error_response(conn, 503, "operator_resume_unavailable", "Operator resume is unavailable")
+    end
+  end
+
+  def operator_resume(conn, _params) do
+    error_response(
+      conn,
+      422,
+      "invalid_operator_resume",
+      "issue_identifiers and reason are required"
+    )
+  end
+
   @spec worker_drains(Conn.t(), map()) :: Conn.t()
   def worker_drains(conn, %{"drained_worker_hosts" => hosts}) when is_list(hosts) do
-    if worker_drain_authorized?(conn) do
+    if operator_action_authorized?(conn) do
       if Enum.all?(hosts, &is_binary/1) do
         worker_drains_response(conn, Presenter.worker_drains_payload(orchestrator(), hosts))
       else
@@ -86,7 +145,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
-  defp worker_drain_authorized?(conn) do
+  defp operator_action_authorized?(conn) do
     expected = Endpoint.config(:worker_drain_token) || System.get_env("SYMPHONY_WORKER_DRAIN_TOKEN")
 
     with expected when is_binary(expected) and byte_size(expected) >= 32 <- expected,
@@ -95,6 +154,50 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       Plug.Crypto.secure_compare(supplied, expected)
     else
       _ -> false
+    end
+  end
+
+  defp normalize_resume_identifiers(identifiers) do
+    normalized =
+      identifiers
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    if length(normalized) in 1..10 and
+         length(normalized) == length(identifiers) and
+         Enum.all?(normalized, &Regex.match?(~r/^[A-Za-z][A-Za-z0-9_-]*-\d+$/, &1)) do
+      {:ok, normalized}
+    else
+      {:error, :invalid_issue_identifiers}
+    end
+  end
+
+  defp normalize_resume_reason(reason) do
+    normalized = String.trim(reason)
+
+    if byte_size(normalized) in 1..500 do
+      {:ok, normalized}
+    else
+      {:error, :invalid_reason}
+    end
+  end
+
+  defp select_resume_issues(issues, identifiers) do
+    issue_by_identifier = Map.new(issues, &{&1.identifier, &1})
+    selected = Enum.map(identifiers, &Map.get(issue_by_identifier, &1))
+
+    if Enum.all?(selected, &match?(%SymphonyElixir.Tracker.Issue{}, &1)) do
+      {:ok, selected}
+    else
+      missing =
+        identifiers
+        |> Enum.zip(selected)
+        |> Enum.filter(fn {_identifier, issue} -> is_nil(issue) end)
+        |> Enum.map(&elem(&1, 0))
+
+      {:error, {:issues_not_in_human_review, missing}}
     end
   end
 

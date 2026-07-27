@@ -157,7 +157,27 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    base_prompt = PromptBuilder.build_prompt(issue, opts)
+
+    case Keyword.get(opts, :operator_resume_reason) do
+      reason when is_binary(reason) and reason != "" ->
+        base_prompt <>
+          """
+
+          Operator-resume guidance:
+
+          - This is an explicitly invoked active issue turn for a ticket that was passive in Human Review.
+          - The operator reports that the external blocker has been resolved: #{reason}
+          - Re-read authoritative external evidence and the Linear issue before acting.
+          - If the blocker is actually resolved, follow the workflow's Human Review readiness-repair rule: move the issue to In Progress, update the existing workpad, and complete the remaining acceptance and validation gates.
+          - If the evidence does not prove resolution, leave the issue in Human Review and record only the concise remaining blocker in the existing workpad.
+          """
+
+      _ ->
+        base_prompt
+    end
+  end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """

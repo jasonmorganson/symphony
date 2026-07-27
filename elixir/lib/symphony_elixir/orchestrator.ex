@@ -1441,7 +1441,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, agent_opts \\ []) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1450,13 +1450,24 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, agent_opts)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         agent_opts
+       ) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(
+             issue,
+             recipient,
+             Keyword.merge(agent_opts, attempt: attempt, worker_host: worker_host)
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -2015,6 +2026,13 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec resume_issues(GenServer.server(), [Issue.t()], String.t(), timeout()) ::
+          {:ok, map()} | {:error, term()}
+  def resume_issues(server, issues, reason, timeout \\ 15_000)
+      when is_list(issues) and is_binary(reason) do
+    GenServer.call(server, {:resume_issues, issues, reason}, timeout)
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
@@ -2121,6 +2139,33 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:resume_issues, issues, reason}, _from, state)
+      when is_list(issues) and is_binary(reason) do
+    state = refresh_runtime_config(state)
+
+    {resumed, skipped, updated_state} =
+      Enum.reduce(issues, {[], [], state}, fn
+        %Issue{state: "Human Review"} = issue, {resumed, skipped, state_acc} ->
+          if resume_dispatch_available?(issue, state_acc) do
+            next_state = do_dispatch_issue(state_acc, issue, nil, nil, operator_resume_reason: reason)
+            {[issue.identifier | resumed], skipped, next_state}
+          else
+            {resumed, [%{identifier: issue.identifier, reason: "capacity_or_claim_unavailable"} | skipped], state_acc}
+          end
+
+        %Issue{} = issue, {resumed, skipped, state_acc} ->
+          {resumed, [%{identifier: issue.identifier, reason: "not_in_human_review"} | skipped], state_acc}
+      end)
+
+    {:reply,
+     {:ok,
+      %{
+        resumed: Enum.reverse(resumed),
+        skipped: Enum.reverse(skipped),
+        requested_at: DateTime.utc_now()
+      }}, updated_state}
+  end
+
   def handle_call(:request_refresh, _from, state) do
     now_ms = System.monotonic_time(:millisecond)
     already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
@@ -2134,6 +2179,16 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp resume_dispatch_available?(%Issue{} = issue, %State{} = state) do
+    Issue.routable?(issue, Config.settings!().tracker.required_labels) and
+      issue.blocked_by == [] and
+      !Map.has_key?(state.running, issue.id) and
+      !Map.has_key?(state.blocked, issue.id) and
+      !Map.has_key?(state.retry_attempts, issue.id) and
+      !MapSet.member?(state.claimed, issue.id) and
+      dispatch_slots_available?(issue, state)
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
