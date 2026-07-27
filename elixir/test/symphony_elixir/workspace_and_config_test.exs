@@ -1453,8 +1453,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     updated =
       Orchestrator.cache_pending_candidates_for_test(state, [running, pending])
 
-    assert updated.pending_candidates == %{
-             observed_at: observed_at,
+    assert %{
+             observed_at: ^observed_at,
              issues: [
                %{
                  issue_id: "issue-pending",
@@ -1463,10 +1463,23 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                  state: "Todo",
                  priority: 2,
                  reason: "orchestrator capacity full",
-                 refresh_status: "observed"
+                 refresh_status: "observed",
+                 queued_at: ^observed_at,
+                 lane: "Todo",
+                 lane_occupants: []
                }
              ]
-           }
+           } = updated.pending_candidates
+
+    later_observation = DateTime.add(observed_at, 600, :second)
+
+    recached =
+      updated
+      |> Map.put(:tracker_counts, %{runnable_issues: 2, blocked_issues: 0, observed_at: later_observation})
+      |> Orchestrator.cache_pending_candidates_for_test([running, pending])
+
+    assert recached.pending_candidates.observed_at == later_observation
+    assert recached.pending_candidates.issues |> List.first() |> Map.fetch!(:queued_at) == observed_at
   end
 
   test "pending projection removes a candidate refreshed into a terminal state" do

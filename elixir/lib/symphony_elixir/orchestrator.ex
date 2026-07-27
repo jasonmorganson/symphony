@@ -1199,6 +1199,8 @@ defmodule SymphonyElixir.Orchestrator do
         _ -> DateTime.utc_now()
       end
 
+    previous_pending = Map.new(pending_candidate_issues(state), &{&1.issue_id, &1})
+
     pending =
       issues
       |> sort_issues_for_dispatch()
@@ -1206,15 +1208,13 @@ defmodule SymphonyElixir.Orchestrator do
         %Issue{} = issue ->
           if pending_candidate?(issue, state, active_states, terminal_states) do
             [
-              %{
-                issue_id: issue.id,
-                identifier: issue.identifier,
-                issue_url: issue.url,
-                state: issue.state,
-                priority: issue.priority,
-                reason: pending_candidate_reason(issue, state),
-                refresh_status: "observed"
-              }
+              pending_candidate_entry(
+                issue,
+                state,
+                "observed",
+                Map.get(previous_pending, issue.id),
+                observed_at
+              )
             ]
           else
             []
@@ -1235,6 +1235,7 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     selected_ids = MapSet.new(selected, & &1.id)
+    previous_pending = Map.new(pending_candidate_issues(state), &{&1.issue_id, &1})
 
     retained =
       state
@@ -1245,15 +1246,13 @@ defmodule SymphonyElixir.Orchestrator do
       Enum.flat_map(refreshed, fn issue ->
         if pending_candidate?(issue, state, active_states, terminal_states) do
           [
-            %{
-              issue_id: issue.id,
-              identifier: issue.identifier,
-              issue_url: issue.url,
-              state: issue.state,
-              priority: issue.priority,
-              reason: pending_candidate_reason(issue, state),
-              refresh_status: "refreshed"
-            }
+            pending_candidate_entry(
+              issue,
+              state,
+              "refreshed",
+              Map.get(previous_pending, issue.id),
+              DateTime.utc_now()
+            )
           ]
         else
           []
@@ -1262,7 +1261,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     pending =
       Enum.map(retained ++ refreshed_pending, fn entry ->
-        %{entry | reason: pending_entry_reason(entry, state)}
+        entry
+        |> Map.put(:reason, pending_entry_reason(entry, state))
+        |> Map.put(:lane_occupants, pending_entry_lane_occupants(entry, state))
       end)
 
     put_pending_candidate_issues(state, pending)
@@ -1277,13 +1278,14 @@ defmodule SymphonyElixir.Orchestrator do
 
         if MapSet.member?(aborted_ids, entry.issue_id) and
              current_reason == "awaiting next dispatch cycle" do
-          %{
-            entry
-            | reason: "dispatch refresh failed: #{inspect(reason)}",
-              refresh_status: "failed"
-          }
+          entry
+          |> Map.put(:reason, "dispatch refresh failed: #{inspect(reason)}")
+          |> Map.put(:refresh_status, "failed")
+          |> Map.put(:lane_occupants, pending_entry_lane_occupants(entry, state))
         else
-          %{entry | reason: current_reason}
+          entry
+          |> Map.put(:reason, current_reason)
+          |> Map.put(:lane_occupants, pending_entry_lane_occupants(entry, state))
         end
       end)
 
@@ -1292,6 +1294,41 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pending_entry_reason(%{state: issue_state}, state) do
     pending_candidate_reason(%Issue{state: issue_state}, state)
+  end
+
+  defp pending_entry_lane_occupants(%{state: issue_state}, state) do
+    pending_lane_occupants(%Issue{state: issue_state}, state.running)
+  end
+
+  defp pending_candidate_entry(issue, state, refresh_status, previous, observed_at) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      state: issue.state,
+      priority: issue.priority,
+      reason: pending_candidate_reason(issue, state),
+      refresh_status: refresh_status,
+      queued_at: pending_queued_at(previous, observed_at),
+      lane: issue.state,
+      lane_occupants: pending_lane_occupants(issue, state.running)
+    }
+  end
+
+  defp pending_queued_at(%{queued_at: %DateTime{} = queued_at}, _observed_at), do: queued_at
+  defp pending_queued_at(_previous, %DateTime{} = observed_at), do: observed_at
+
+  defp pending_lane_occupants(%Issue{state: state_name}, running) when is_map(running) do
+    running
+    |> Enum.flat_map(fn
+      {_issue_id, %{issue: %Issue{state: ^state_name}, identifier: identifier}}
+      when is_binary(identifier) ->
+        [identifier]
+
+      _ ->
+        []
+    end)
+    |> Enum.sort()
   end
 
   defp pending_candidate_issues(%State{pending_candidates: %{issues: issues}})
@@ -1780,19 +1817,24 @@ defmodule SymphonyElixir.Orchestrator do
            )}
       end
     else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+      Logger.debug("No available slots for retrying #{issue_context(issue)}; returning issue to the scheduler queue")
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+      queued_state =
+        state
+        |> release_issue_claim(issue.id)
+        |> enqueue_pending_candidate(issue, "capacity queue")
+
+      {:noreply, queued_state}
     end
+  end
+
+  defp enqueue_pending_candidate(state, %Issue{} = issue, refresh_status) do
+    now = DateTime.utc_now()
+    previous = Enum.find(pending_candidate_issues(state), &(&1.issue_id == issue.id))
+    retained = Enum.reject(pending_candidate_issues(state), &(&1.issue_id == issue.id))
+    entry = pending_candidate_entry(issue, state, refresh_status, previous, now)
+
+    %{state | pending_candidates: %{observed_at: now, issues: retained ++ [entry]}}
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
@@ -1930,6 +1972,38 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp worker_slots_available?(%State{} = state) do
     select_worker_host(state, nil) != :no_worker_capacity
+  end
+
+  defp available_worker_hosts(%State{configured_worker_hosts: []} = state) do
+    if available_slots(state) > 0, do: ["local"], else: []
+  end
+
+  defp available_worker_hosts(%State{} = state) do
+    Enum.filter(state.configured_worker_hosts, fn host ->
+      not MapSet.member?(state.drained_worker_hosts, host) and
+        worker_host_slots_available?(state, host)
+    end)
+  end
+
+  defp available_worker_slot_count(%State{configured_worker_hosts: []} = state),
+    do: available_slots(state)
+
+  defp available_worker_slot_count(%State{} = state) do
+    per_host_limit = Config.settings!().worker.max_concurrent_agents_per_host
+
+    state
+    |> available_worker_hosts()
+    |> Enum.reduce(0, fn host, total ->
+      host_slots =
+        if is_integer(per_host_limit) and per_host_limit > 0 do
+          max(per_host_limit - running_worker_host_count(state.running, host), 0)
+        else
+          1
+        end
+
+      total + host_slots
+    end)
+    |> min(available_slots(state))
   end
 
   defp worker_slots_available?(%State{} = state, preferred_worker_host) do
@@ -2114,7 +2188,9 @@ defmodule SymphonyElixir.Orchestrator do
        blocked: blocked,
        worker_pool: %{
          configured_hosts: state.configured_worker_hosts,
-         drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort()
+         drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort(),
+         available_hosts: available_worker_hosts(state),
+         available_slots: available_worker_slot_count(state)
        },
        tracker: state.tracker_counts,
        pending: state.pending_candidates,

@@ -167,13 +167,18 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp pending_payload(%{observed_at: observed_at, issues: issues}) when is_list(issues) do
+    payload_issues = Enum.map(issues, &pending_entry_payload/1)
+
     %{
       observed_at: iso8601(observed_at),
-      issues: Enum.map(issues, &pending_entry_payload/1)
+      issues: payload_issues,
+      oldest_age_seconds: payload_issues |> Enum.map(& &1.queue_age_seconds) |> Enum.max(fn -> 0 end),
+      slo_breaches: Enum.count(payload_issues, &(&1.queue_age_seconds >= 300))
     }
   end
 
-  defp pending_payload(_pending), do: %{observed_at: nil, issues: []}
+  defp pending_payload(_pending),
+    do: %{observed_at: nil, issues: [], oldest_age_seconds: 0, slo_breaches: 0}
 
   defp pending_issues(snapshot) do
     case Map.get(snapshot, :pending) do
@@ -190,9 +195,19 @@ defmodule SymphonyElixirWeb.Presenter do
       state: entry.state,
       priority: Map.get(entry, :priority),
       reason: entry.reason,
-      refresh_status: Map.get(entry, :refresh_status, "observed")
+      refresh_status: Map.get(entry, :refresh_status, "observed"),
+      queued_at: iso8601(Map.get(entry, :queued_at)),
+      queue_age_seconds: queue_age_seconds(Map.get(entry, :queued_at)),
+      lane: Map.get(entry, :lane, entry.state),
+      lane_occupants: Map.get(entry, :lane_occupants, [])
     }
   end
+
+  defp queue_age_seconds(%DateTime{} = queued_at) do
+    max(DateTime.diff(DateTime.utc_now(), queued_at, :second), 0)
+  end
+
+  defp queue_age_seconds(_queued_at), do: 0
 
   defp running_issue_payload(running) do
     %{

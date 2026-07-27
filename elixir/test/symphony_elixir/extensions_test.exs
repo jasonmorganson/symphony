@@ -336,6 +336,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              ],
              "pending" => %{
                "observed_at" => "2026-07-23T16:00:00Z",
+               "oldest_age_seconds" => state_payload["pending"]["oldest_age_seconds"],
+               "slo_breaches" => 1,
                "issues" => [
                  %{
                    "issue_id" => "issue-pending",
@@ -344,13 +346,22 @@ defmodule SymphonyElixir.ExtensionsTest do
                    "state" => "Merging",
                    "priority" => 1,
                    "reason" => "state concurrency limit reached",
-                   "refresh_status" => "observed"
+                   "refresh_status" => "observed",
+                   "queued_at" => state_payload["pending"]["issues"] |> List.first() |> Map.fetch!("queued_at"),
+                   "queue_age_seconds" =>
+                     state_payload["pending"]["issues"]
+                     |> List.first()
+                     |> Map.fetch!("queue_age_seconds"),
+                   "lane" => "Merging",
+                   "lane_occupants" => ["MT-MERGING"]
                  }
                ]
              },
              "worker_pool" => %{
                "configured_hosts" => ["worker-a", "worker-b"],
-               "drained_hosts" => []
+               "drained_hosts" => [],
+               "available_hosts" => ["worker-b"],
+               "available_slots" => 1
              },
              "tracker" => %{
                "runnable_issues" => 5,
@@ -646,6 +657,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-PENDING"
     assert html =~ "Pending eligible work"
     assert html =~ "state concurrency limit reached"
+    assert html =~ "Queue age"
+    assert html =~ "Lane occupant"
+    assert html =~ "MT-MERGING"
+    assert html =~ "Schedulable workers:"
+    assert html =~ "worker-b"
+    assert html =~ "queue SLO breaches"
     assert html =~ "Observed at"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
@@ -864,11 +881,19 @@ defmodule SymphonyElixir.ExtensionsTest do
             state: "Merging",
             priority: 1,
             reason: "state concurrency limit reached",
-            refresh_status: "observed"
+            refresh_status: "observed",
+            queued_at: DateTime.add(DateTime.utc_now(), -360, :second),
+            lane: "Merging",
+            lane_occupants: ["MT-MERGING"]
           }
         ]
       },
-      worker_pool: %{configured_hosts: ["worker-a", "worker-b"], drained_hosts: []},
+      worker_pool: %{
+        configured_hosts: ["worker-a", "worker-b"],
+        drained_hosts: [],
+        available_hosts: ["worker-b"],
+        available_slots: 1
+      },
       tracker: %{
         runnable_issues: 5,
         blocked_issues: 2,

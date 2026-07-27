@@ -1436,8 +1436,12 @@ SHOULD return:
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
 - `pending` (the last candidate observation timestamp plus eligible-but-unassigned issue rows and
-  their capacity reason); implementations SHOULD derive it from the candidate fetch already used
-  for dispatch rather than add a tracker request
+  their first queued time, queue age, state lane, lane occupants, and capacity reason);
+  implementations SHOULD derive it from the candidate fetch already used for dispatch rather than
+  add a tracker request
+- `worker_pool` SHOULD distinguish configured and drained hosts from currently schedulable
+  non-drained hosts and available slots; schedulability alone MUST NOT be described as an
+  independent authentication proof
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`
   - `input_tokens`
@@ -2094,10 +2098,8 @@ on_retry_timer(issue_id, state):
     return state
 
   if no_available_slots(state):
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: issue.identifier,
-      error: "no available orchestrator slots"
-    })
+    state.claimed.remove(issue_id)
+    return enqueue_pending_candidate(state, issue, reason="capacity queue")
 
   return dispatch_issue(issue, state, attempt=retry_entry.attempt)
 ```
