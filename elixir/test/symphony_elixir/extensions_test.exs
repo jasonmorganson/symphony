@@ -68,6 +68,17 @@ defmodule SymphonyElixir.ExtensionsTest do
           active_drained_hosts: []
         }}, state}
     end
+
+    def handle_call({:resume_issues, issues, reason}, _from, state) do
+      {:reply,
+       {:ok,
+        %{
+          resumed: Enum.map(issues, & &1.identifier),
+          skipped: [],
+          requested_at: DateTime.utc_now(),
+          reason: reason
+        }}, state}
+    end
   end
 
   setup do
@@ -438,6 +449,73 @@ defmodule SymphonyElixir.ExtensionsTest do
       |> put("/api/v1/worker-drains", %{"drained_worker_hosts" => [%{"bad" => "host"}]})
 
     assert json_response(invalid_conn, 422)["error"]["code"] == "invalid_worker_hosts"
+  end
+
+  test "operator resume selectively dispatches authenticated Human Review issues" do
+    orchestrator_name = Module.concat(__MODULE__, :OperatorResumeOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot()
+      )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: "issue-review",
+        identifier: "MT-251",
+        state: "Human Review",
+        dispatchable: true
+      },
+      %Issue{
+        id: "issue-active",
+        identifier: "MT-252",
+        state: "In Progress",
+        dispatchable: true
+      }
+    ])
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      worker_drain_token: @worker_drain_token
+    )
+
+    unauthorized =
+      post(build_conn(), "/api/v1/operator-resume", %{
+        "issue_identifiers" => ["MT-251"],
+        "reason" => "credential rotated"
+      })
+
+    assert json_response(unauthorized, 401)["error"]["code"] == "unauthorized"
+
+    resumed =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
+      |> post("/api/v1/operator-resume", %{
+        "issue_identifiers" => ["MT-251"],
+        "reason" => "credential rotated"
+      })
+
+    assert %{
+             "resumed" => ["MT-251"],
+             "skipped" => [],
+             "reason" => "credential rotated"
+           } = json_response(resumed, 202)
+
+    not_in_review =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
+      |> post("/api/v1/operator-resume", %{
+        "issue_identifiers" => ["MT-252"],
+        "reason" => "credential rotated"
+      })
+
+    assert json_response(not_in_review, 409)["error"]["code"] ==
+             "issues_not_in_human_review"
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
