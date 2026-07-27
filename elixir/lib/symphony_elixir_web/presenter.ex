@@ -23,6 +23,7 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           pending: pending_payload(Map.get(snapshot, :pending)),
+          merge_writer: merge_writer_payload(Map.get(snapshot, :merge_writer)),
           worker_pool: snapshot.worker_pool,
           tracker: Map.get(snapshot, :tracker),
           codex_totals: snapshot.codex_totals,
@@ -35,6 +36,14 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
     end
+  end
+
+  defp merge_writer_payload(nil), do: nil
+
+  defp merge_writer_payload(%{acquired_at: %DateTime{} = acquired_at} = lease) do
+    lease
+    |> Map.take([:issue_id, :identifier])
+    |> Map.put(:acquired_at, DateTime.to_iso8601(acquired_at))
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}

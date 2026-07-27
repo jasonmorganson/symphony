@@ -979,6 +979,81 @@ defmodule SymphonyElixir.CoreTest do
     send(agent_pid, :stop)
   end
 
+  test "merge writer lease serializes final writes and releases on agent crash" do
+    orchestrator_name = Module.concat(__MODULE__, "MergeWriter#{System.unique_integer([:positive])}")
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    first = %Issue{id: "merge-1", identifier: "MT-1", state: "Merging"}
+    second = %Issue{id: "merge-2", identifier: "MT-2", state: "Merging"}
+    first_ref = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | startup_cleanup_ref: nil,
+          startup_cleanup_monitor_ref: nil,
+          running: %{
+            first.id => %{
+              issue: first,
+              identifier: first.identifier,
+              ref: first_ref,
+              pid: self(),
+              started_at: DateTime.utc_now(),
+              session_id: "session-1",
+              codex_app_server_pid: nil,
+              codex_input_tokens: 0,
+              codex_output_tokens: 0,
+              codex_total_tokens: 0,
+              last_codex_timestamp: nil,
+              last_codex_message: nil,
+              last_codex_event: nil
+            },
+            second.id => %{
+              issue: second,
+              identifier: second.identifier,
+              ref: make_ref(),
+              pid: self(),
+              started_at: DateTime.utc_now(),
+              session_id: "session-2",
+              codex_app_server_pid: nil,
+              codex_input_tokens: 0,
+              codex_output_tokens: 0,
+              codex_total_tokens: 0,
+              last_codex_timestamp: nil,
+              last_codex_message: nil,
+              last_codex_event: nil
+            }
+          },
+          claimed: MapSet.new([first.id, second.id])
+      }
+    end)
+
+    assert {:ok, %{acquired: true, issue_id: "merge-1"}} =
+             Orchestrator.acquire_merge_writer(pid, first)
+
+    assert %{merge_writer: %{issue_id: "merge-1", identifier: "MT-1"}} =
+             Orchestrator.snapshot(orchestrator_name, 1_000)
+
+    assert {:error, {:merge_writer_busy, "MT-1"}} =
+             Orchestrator.acquire_merge_writer(pid, second)
+
+    assert {:error, {:merge_writer_owned_by, "MT-1"}} =
+             Orchestrator.release_merge_writer(pid, second)
+
+    send(pid, {:DOWN, first_ref, :process, self(), :boom})
+
+    assert eventually_value(fn ->
+             case Orchestrator.acquire_merge_writer(pid, second) do
+               {:ok, %{acquired: true, issue_id: "merge-2"}} -> true
+               _ -> nil
+             end
+           end)
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
@@ -1915,7 +1990,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "lacks the matching label, add the"
     assert prompt =~ "label during normal workpad reconciliation"
     assert prompt =~ "External-wait checkpoint protocol"
-    assert prompt =~ "End the current invocation cleanly without changing the Linear state"
+    assert prompt =~ ~s(`{"action":"yield"}`)
+    assert prompt =~ "releases any writer lease"
     assert prompt =~ "the same failure is proven to predate this merge"
     assert prompt =~ "Only stop early for a true external blocker"
     assert prompt =~ "Do not include \"next steps for user\""
