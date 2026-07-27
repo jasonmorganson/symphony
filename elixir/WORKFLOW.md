@@ -144,6 +144,39 @@ only on an external asynchronous event such as GitHub checks, deployment verific
 Never use this protocol while an actionable diff, conflict, reviewer comment, or deterministic
 failure remains. Those require work in the current invocation.
 
+## Exact-state validation evidence
+
+Treat a successful local validation result as reusable evidence, not as a reason to rerun the same
+commands on every continuation. The single workpad is the durable evidence cache.
+
+Before running a local validation set, compute and record this identity:
+
+- `head_sha`: the full commit SHA being validated (`git rev-parse HEAD`);
+- `main_sha`: the full fetched default-branch SHA used as the comparison/merge base
+  (`git rev-parse origin/main` after `git fetch origin main`);
+- `config_digest`: SHA-256 of a canonical, newline-delimited manifest containing every command in
+  the validation set, its relevant arguments/environment mode, and the contents or blob SHAs of
+  configuration files that select or materially change those checks.
+
+Record successful evidence in the workpad `Validation` section with the exact identity, commands,
+terminal result, and observation time. Before rerunning a validation set, re-read that evidence and
+recompute all three identity fields. Reuse it only when:
+
+1. all three fields match exactly;
+2. every required command has a recorded successful terminal result;
+3. the working tree is clean, so no uncommitted input exists outside `head_sha`; and
+4. no ticket requirement, review request, or documented repository policy explicitly requires a
+   fresh execution.
+
+If reusable, cite the matching evidence in the workpad and continue without rerunning those local
+commands. Any changed head, fetched main, command set, environment mode, or relevant check
+configuration invalidates the evidence. Missing, partial, ambiguous, or failed evidence is never
+reusable.
+
+This optimization applies only to redundant local validation. It never replaces required GitHub
+checks, human review, deployment verification, exact-main verification after merge, or a targeted
+rerun needed to prove a new fix. Query those authoritative external gates for the exact current SHA.
+
 ## Related skills
 
 - `linear`: interact with Linear.
