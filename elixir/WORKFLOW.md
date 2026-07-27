@@ -30,6 +30,13 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  continuation_delay_ms_by_state:
+    Merging: 60000
+  dispatch_state_order:
+    - Merging
+  dispatch_priority_labels:
+    - production-gate
+    - main-ci
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -97,6 +104,28 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
+
+## Shared-gate repair classification
+
+Use workflow-owned Linear writes to classify only issues that repair a shared gate:
+
+- Apply `main-ci` when the issue's explicit scope is repairing a deterministic failure on the
+  repository's protected default branch that blocks completion of other already-merged work.
+- Apply `production-gate` when the issue's explicit scope is repairing a deterministic deployment,
+  production audit, or release gate that blocks completion of other otherwise-ready issues.
+- If the current issue already has that explicit repair scope but lacks the matching label, add the
+  label during normal workpad reconciliation. Do not wait for an operator or mutate it from an
+  external monitor.
+- When filing a new shared-gate repair issue, include the matching label in the same workflow-owned
+  create/update sequence. Reuse an existing active owner for the same failure signature instead of
+  filing a duplicate.
+- Never infer a repair label merely because an ordinary issue observes a failing check. Require a
+  reproduced failure signature, proof that the repair is shared, and explicit repair acceptance
+  criteria on the owner issue.
+
+These labels are scheduler inputs: `production-gate` ranks before `main-ci`, and both rank before
+ordinary work within the same state. They do not bypass review, validation, or the serialized final
+merge writer.
 
 ## External-wait checkpoint protocol
 
