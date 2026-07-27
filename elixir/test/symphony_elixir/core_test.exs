@@ -1132,6 +1132,62 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
+  test "capacity-bound retry returns to the scheduler queue without amplifying attempts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Human Review", "Merging"]
+    )
+
+    issue_id = "retry-capacity-bound"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-QUEUE",
+      title: "Wait for capacity",
+      state: "Merging",
+      priority: 1,
+      dispatchable: true,
+      labels: []
+    }
+
+    running_issue = %Issue{
+      id: "merging-occupant",
+      identifier: "MT-OCCUPANT",
+      title: "Current lane occupant",
+      state: "Merging",
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{
+        running_issue.id => %{
+          identifier: running_issue.identifier,
+          issue: running_issue,
+          worker_host: nil
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 7, %{
+        identifier: issue.identifier,
+        error: "agent exited"
+      })
+
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+
+    assert %{issues: [pending]} = updated_state.pending_candidates
+    assert pending.issue_id == issue_id
+    assert pending.refresh_status == "capacity queue"
+    assert pending.reason == "orchestrator capacity full"
+    assert pending.lane == "Merging"
+    assert pending.lane_occupants == ["MT-OCCUPANT"]
+    assert %DateTime{} = pending.queued_at
+  end
+
   test "retry releases its claim when dispatch revalidation no longer finds the issue" do
     test_root =
       Path.join(

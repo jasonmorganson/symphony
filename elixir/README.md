@@ -284,7 +284,9 @@ codex:
   admission delay are exposed with the quota snapshot. The state API exposes the latest candidate
   observation as `tracker` with `runnable_issues`, `blocked_issues`, and `observed_at`. It also
   projects eligible candidates that were not assigned from that same fetch as `pending`, including
-  the observation time and capacity reason; this projection performs no additional tracker read.
+  the first queued time, queue age, state lane, current lane occupants, and capacity reason; this
+  projection performs no additional tracker read. The worker-pool snapshot includes schedulable
+  non-drained hosts and available slots (it does not independently prove worker authentication).
 - Dispatch order: by default, lower priority, older creation time, and identifier remain the
   ordering keys across all states. A workflow can set `agent.dispatch_state_order` to prioritize
   only listed states (for example, `["Merging"]`). Within each state rank, configured
@@ -292,7 +294,9 @@ codex:
   identifier.
   While any valid retry entry is pending, one global slot is reserved as a retry lane, so newly
   discovered work cannot repeatedly take the last slot while existing work backs off. Retry
-  dispatch itself uses that ordinary global slot after consuming its retry entry.
+  dispatch itself uses that ordinary global slot after consuming its retry entry. If the retry is
+  ready but capacity is unavailable, it returns to the scheduler-owned pending queue without
+  incrementing the failure attempt or creating another capacity retry timer.
 
 ### GitHub Issues adapter
 
@@ -348,7 +352,8 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
-- Pending eligible work shows the last observed unassigned candidates and why each is waiting
+- Pending eligible work shows queue age, state lane, current lane occupant, schedulable workers,
+  five-minute SLO breaches, and why each candidate is waiting
 
 ## Project Layout
 
