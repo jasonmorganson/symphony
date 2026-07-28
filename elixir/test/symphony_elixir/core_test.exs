@@ -1513,6 +1513,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not include \"next steps for user\""
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "if the attached PR is already merged, move the issue directly to `Done`"
+    assert prompt =~ "In `Merging`, a `MERGED` PR is completion evidence"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end
