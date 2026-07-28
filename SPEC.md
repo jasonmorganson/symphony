@@ -1401,6 +1401,10 @@ SHOULD return:
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
+- Implementations that expose external worker-pool control MAY also include:
+  - `demand.eligible` and `demand.observed_at`, derived from the latest tracker poll
+  - configured, drained, and available worker hosts
+  - currently available worker-session slots
 
 RECOMMENDED snapshot error modes:
 
@@ -1501,6 +1505,8 @@ Minimum endpoints:
 - `GET /api/v1/state`
   - Returns a summary view of the current system state (running sessions, retry queue/delays,
     aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
+  - Implementations with an external worker pool MAY include the demand and worker-pool fields from
+    Section 13.3 without requiring another tracker request.
   - Suggested response shape:
 
     ```json
@@ -2259,6 +2265,8 @@ Extension config:
   - When omitted, work runs locally.
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
   - Shared per-host cap applied across configured SSH hosts.
+- `worker.drain_state_path` (path string, OPTIONAL)
+  - Durable exact set of SSH hosts excluded from new dispatches.
 
 ### A.1 Execution Model
 
@@ -2282,6 +2290,10 @@ Extension config:
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
+- Drained hosts MUST remain ineligible for new dispatches, while active sessions already assigned
+  to a newly drained host continue under the normal session lifecycle.
+- An implementation exposing remote drain control SHOULD replace the complete durable drain set
+  atomically, validate hosts against `worker.ssh_hosts`, and authenticate mutation requests.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - Implementations MAY fail over to another host when the original host is unavailable before work

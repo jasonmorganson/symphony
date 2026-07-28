@@ -57,6 +57,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:set_drained_worker_hosts, hosts}, _from, state) do
+      configured_hosts = state |> Keyword.fetch!(:snapshot) |> get_in([:worker_pool, :configured_hosts])
+      drained_hosts = Enum.sort(hosts)
+
+      {:reply,
+       {:ok,
+        %{
+          configured_hosts: configured_hosts,
+          drained_hosts: drained_hosts,
+          active_drained_hosts: []
+        }}, state}
+    end
   end
 
   setup do
@@ -263,6 +276,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
              "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "demand" => %{
+               "eligible" => 4,
+               "observed_at" => "2026-07-28T10:00:00Z"
+             },
+             "worker_pool" => %{
+               "configured" => 2,
+               "drained" => 1,
+               "available" => 1,
+               "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
+               "drained_hosts" => ["symphony-worker-1"],
+               "available_hosts" => ["symphony-worker-0"],
+               "available_slots" => 1
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -376,6 +402,38 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "worker drain updates require authorization and return the exact drain set" do
+    orchestrator_name = Module.concat(__MODULE__, :WorkerDrainApiOrchestrator)
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: static_snapshot()})
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      worker_drain_token: String.duplicate("d", 32)
+    )
+
+    assert json_response(
+             put(build_conn(), "/api/v1/worker-drains", %{
+               "drained_worker_hosts" => ["symphony-worker-1"]
+             }),
+             401
+           )["error"]["code"] == "unauthorized"
+
+    conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> String.duplicate("d", 32))
+      |> put("/api/v1/worker-drains", %{
+        "drained_worker_hosts" => ["symphony-worker-1"]
+      })
+
+    assert json_response(conn, 200) == %{
+             "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
+             "drained_hosts" => ["symphony-worker-1"],
+             "active_drained_hosts" => []
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -702,6 +760,16 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
+      demand: %{eligible: 4, observed_at: ~U[2026-07-28 10:00:00Z]},
+      worker_pool: %{
+        configured: 2,
+        drained: 1,
+        available: 1,
+        configured_hosts: ["symphony-worker-0", "symphony-worker-1"],
+        drained_hosts: ["symphony-worker-1"],
+        available_hosts: ["symphony-worker-0"],
+        available_slots: 1
+      },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }

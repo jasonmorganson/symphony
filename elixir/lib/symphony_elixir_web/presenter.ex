@@ -18,6 +18,8 @@ defmodule SymphonyElixirWeb.Presenter do
             retrying: length(snapshot.retrying),
             blocked: length(Map.get(snapshot, :blocked, []))
           },
+          demand: demand_payload(Map.get(snapshot, :demand)),
+          worker_pool: Map.get(snapshot, :worker_pool),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
@@ -62,6 +64,24 @@ defmodule SymphonyElixirWeb.Presenter do
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
   end
+
+  @spec worker_drains_payload(GenServer.name(), [String.t()]) ::
+          {:ok, map()} | {:error, term()}
+  def worker_drains_payload(orchestrator, hosts) do
+    case Orchestrator.set_drained_worker_hosts(orchestrator, hosts) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, reason} -> {:error, reason}
+      :timeout -> {:error, :timeout}
+      :unavailable -> {:error, :unavailable}
+    end
+  end
+
+  defp demand_payload(%{eligible: eligible, observed_at: observed_at})
+       when is_integer(eligible) and eligible >= 0 do
+    %{eligible: eligible, observed_at: iso8601(observed_at)}
+  end
+
+  defp demand_payload(_demand), do: %{eligible: 0, observed_at: nil}
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{

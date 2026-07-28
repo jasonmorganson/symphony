@@ -3,7 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, RateLimit}
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -638,6 +638,142 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+  end
+
+  test "linear client normalizes rate limits and shares the cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :LinearRateLimit)
+    start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
+    parent = self()
+
+    assert {:error, {:linear_rate_limited, 2_000}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 send(parent, :linear_request_sent)
+
+                 {:ok,
+                  %{
+                    status: 400,
+                    headers: %{"retry-after" => "2"},
+                    body: %{
+                      "errors" => [
+                        %{"extensions" => %{"code" => "RATELIMITED", "statusCode" => 429}}
+                      ]
+                    }
+                  }}
+               end
+             )
+
+    assert_receive :linear_request_sent
+
+    assert {:error, {:linear_rate_limited, remaining_ms}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers -> flunk("cooldown must prevent the request") end
+             )
+
+    assert remaining_ms in 1..2_000
+  end
+
+  test "linear client normalizes HTTP 429 and resumes after its cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :HttpLinearRateLimit)
+    start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
+
+    assert {:error, {:linear_rate_limited, 0}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 429, headers: %{"retry-after" => "0"}, body: %{}}}
+               end
+             )
+
+    assert {:ok, %{"data" => %{"viewer" => %{"id" => "recovered"}}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{"data" => %{"viewer" => %{"id" => "recovered"}}}
+                  }}
+               end
+             )
+
+    assert :ok = RateLimit.activate(0)
+    assert :ok = RateLimit.check()
+  end
+
+  test "eligible demand includes active claims but excludes blocked issues" do
+    issues = [
+      %Issue{id: "ready", identifier: "MT-READY", title: "Ready", state: "Todo", dispatchable: true},
+      %Issue{
+        id: "claimed",
+        identifier: "MT-CLAIMED",
+        title: "Claimed",
+        state: "Todo",
+        dispatchable: true
+      },
+      %Issue{
+        id: "blocked",
+        identifier: "MT-BLOCKED",
+        title: "Blocked",
+        state: "Todo",
+        dispatchable: true
+      }
+    ]
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new(["claimed"]),
+      blocked: %{"blocked" => %{}}
+    }
+
+    assert %{eligible: 2, observed_at: %DateTime{}} =
+             Orchestrator.demand_from_issues_for_test(issues, state)
+  end
+
+  test "worker drain replacement survives orchestrator restart" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worker-drains-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      drain_path = Path.join(test_root, "worker-drains.json")
+      hosts = ["symphony-worker-0", "symphony-worker-1"]
+      orchestrator_name = Module.concat(__MODULE__, :DurableWorkerDrainOrchestrator)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        worker_ssh_hosts: hosts,
+        worker_drain_state_path: drain_path
+      )
+
+      {:ok, first_pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      assert {:ok, %{drained_hosts: ["symphony-worker-1"]}} =
+               Orchestrator.set_drained_worker_hosts(
+                 orchestrator_name,
+                 ["symphony-worker-1"]
+               )
+
+      GenServer.stop(first_pid)
+
+      {:ok, second_pid} = Orchestrator.start_link(name: orchestrator_name)
+      snapshot = Orchestrator.snapshot(orchestrator_name, 5_000)
+      assert snapshot.worker_pool.drained_hosts == ["symphony-worker-1"]
+      GenServer.stop(second_pid)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
@@ -1371,21 +1507,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "schema parse normalizes policy keys and env-backed fallbacks" do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
+    missing_drain_env = "SYMP_MISSING_DRAIN_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"
     missing_secret_env = "SYMP_MISSING_SECRET_#{System.unique_integer([:positive])}"
 
     previous_missing_workspace_env = System.get_env(missing_workspace_env)
+    previous_missing_drain_env = System.get_env(missing_drain_env)
     previous_empty_secret_env = System.get_env(empty_secret_env)
     previous_missing_secret_env = System.get_env(missing_secret_env)
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
     System.delete_env(missing_workspace_env)
+    System.delete_env(missing_drain_env)
     System.put_env(empty_secret_env, "")
     System.delete_env(missing_secret_env)
     System.put_env("LINEAR_API_KEY", "fallback-linear-token")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
+      restore_env(missing_drain_env, previous_missing_drain_env)
       restore_env(empty_secret_env, previous_empty_secret_env)
       restore_env(missing_secret_env, previous_missing_secret_env)
       restore_env("LINEAR_API_KEY", previous_linear_api_key)
@@ -1395,11 +1535,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{kind: "linear", api_key: "$#{empty_secret_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
+               worker: %{drain_state_path: "$#{missing_drain_env}"},
                codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
              })
 
     assert settings.tracker.api_key == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert settings.worker.drain_state_path == nil
 
     assert settings.codex.approval_policy == %{
              "reject" => %{"sandbox_approval" => true}

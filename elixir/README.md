@@ -199,6 +199,24 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `worker.drain_state_path` enables exact durable worker drains. When configured, a missing or
+  invalid drain file fails closed by draining every configured worker until an authenticated
+  replacement succeeds.
+
+### Kubernetes autoscaling extensions
+
+This fork keeps upstream orchestration and adds a small authenticated surface for an external
+Kubernetes controller:
+
+- `GET /api/v1/state` includes cached `demand.eligible`, `demand.observed_at`, and `worker_pool`
+  counts. Demand is calculated from the candidate list already fetched by the normal poll.
+- `PUT /api/v1/worker-drains` replaces the exact durable drain set. It requires
+  `Authorization: Bearer <SYMPHONY_WORKER_DRAIN_TOKEN>` with a token of at least 32 bytes and
+  returns configured, drained, and still-active drained hosts.
+- Drained hosts are excluded from normal worker selection. No state, including `Merging`, receives
+  a fork-specific concurrency limit.
+- Linear HTTP 429 responses and GraphQL `RATELIMITED` errors activate one shared cooldown, so
+  concurrent poll, retry, and tool paths do not amplify provider throttling.
 
 ### Linear adapter profile
 
