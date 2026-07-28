@@ -154,9 +154,6 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
-      field(:continuation_delay_ms_by_state, :map, default: %{})
-      field(:dispatch_state_order, {:array, :string}, default: [])
-      field(:dispatch_priority_labels, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -164,15 +161,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [
-          :max_concurrent_agents,
-          :max_turns,
-          :max_retry_backoff_ms,
-          :max_concurrent_agents_by_state,
-          :continuation_delay_ms_by_state,
-          :dispatch_state_order,
-          :dispatch_priority_labels
-        ],
+        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -180,12 +169,6 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
-      |> update_change(:continuation_delay_ms_by_state, &Schema.normalize_state_limits/1)
-      |> Schema.validate_state_limits(:continuation_delay_ms_by_state)
-      |> update_change(:dispatch_state_order, &Schema.normalize_state_order/1)
-      |> Schema.validate_state_order(:dispatch_state_order)
-      |> update_change(:dispatch_priority_labels, &Schema.normalize_state_order/1)
-      |> Schema.validate_state_order(:dispatch_priority_labels)
     end
   end
 
@@ -368,29 +351,6 @@ defmodule SymphonyElixir.Config.Schema do
     state_name
     |> String.trim()
     |> String.downcase()
-  end
-
-  @doc false
-  @spec normalize_state_order([String.t()]) :: [String.t()]
-  def normalize_state_order(states) when is_list(states) do
-    Enum.map(states, &normalize_issue_state/1)
-  end
-
-  @doc false
-  @spec validate_state_order(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
-  def validate_state_order(changeset, field) do
-    validate_change(changeset, field, fn ^field, states ->
-      cond do
-        Enum.any?(states, &(&1 == "")) ->
-          [{field, "state names must not be blank"}]
-
-        length(states) != length(Enum.uniq(states)) ->
-          [{field, "state names must be unique"}]
-
-        true ->
-          []
-      end
-    end)
   end
 
   @doc false

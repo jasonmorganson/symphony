@@ -51,9 +51,6 @@ tracker issue can become a dispatch candidate again after restart.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
-   - The bundled workflow reuses successful local validation only when the PR head SHA, fetched
-     default-branch SHA, and validation configuration digest all match. Required GitHub, review,
-     deployment, and post-merge gates remain authoritative.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
@@ -92,9 +89,6 @@ Supported release targets:
 
 `v*` tags publish all four targets with checksums. A manual workflow run builds the same
 artifacts without creating a release.
-
-Set `SYMPHONY_RELEASE_FORMAT=otp` when a container or deployment system needs the standard
-unwrapped OTP release directory from `mix release` instead of a Burrito executable.
 
 After downloading the executable for your platform from a release:
 
@@ -137,8 +131,6 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
-  continuation_delay_ms_by_state:
-    In Review: 300000
 codex:
   command: codex app-server
 ---
@@ -173,16 +165,6 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
-- `agent.continuation_delay_ms_by_state` throttles clean-exit re-entry for selected active states.
-  State names are normalized like `max_concurrent_agents_by_state`; unlisted states use `1000` ms.
-- `agent.dispatch_state_order` optionally lists state names in dispatch-preference order. State
-  names are normalized and must be unique and non-blank. The default empty list preserves normal
-  priority, creation-time, and identifier ordering across states.
-- `agent.dispatch_priority_labels` optionally lists issue labels in dispatch-preference order.
-  Labels are matched case-insensitively after trimming. The first matching configured label ranks
-  ahead of tracker priority and age within the same state rank. Use this for narrowly scoped
-  shared-gate repairs such as `production-gate` and `main-ci`, not as a replacement for ordinary
-  tracker priority.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -216,13 +198,25 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, `/api/v1/refresh`, and
-  `/api/v1/worker-drains`.
-- `worker.drain_state_path` enables a durable scheduler-owned drain set. `PUT
-  /api/v1/worker-drains` requires a bearer token from `SYMPHONY_WORKER_DRAIN_TOKEN`, persists the
-  requested `drained_worker_hosts` before acknowledging it, and excludes drained hosts from new
-  and preferred-retry dispatch. A configured missing or invalid state file starts with every host
-  drained until the control plane reconciles availability.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `worker.drain_state_path` enables exact durable worker drains. When configured, a missing or
+  invalid drain file fails closed by draining every configured worker until an authenticated
+  replacement succeeds.
+
+### Kubernetes autoscaling extensions
+
+This fork keeps upstream orchestration and adds a small authenticated surface for an external
+Kubernetes controller:
+
+- `GET /api/v1/state` includes cached `demand.eligible`, `demand.observed_at`, and `worker_pool`
+  counts. Demand is calculated from the candidate list already fetched by the normal poll.
+- `PUT /api/v1/worker-drains` replaces the exact durable drain set. It requires
+  `Authorization: Bearer <SYMPHONY_WORKER_DRAIN_TOKEN>` with a token of at least 32 bytes and
+  returns configured, drained, and still-active drained hosts.
+- Drained hosts are excluded from normal worker selection. No state, including `Merging`, receives
+  a fork-specific concurrency limit.
+- Linear HTTP 429 responses and GraphQL `RATELIMITED` errors activate one shared cooldown, so
+  concurrent poll, retry, and tool paths do not amplify provider throttling.
 
 ### Linear adapter profile
 
@@ -264,42 +258,7 @@ codex:
   to `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
   `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
-  human-readable provider detail. Linear's `RATELIMITED` GraphQL payload is treated as a rate limit
-  even when the HTTP wrapper reports `400`; it activates one process-wide cooldown shared by
-  polling, issue refreshes, and `linear_graphql`. A completed agent turn deferred by that cooldown
-  is not converted into a failed run; its continuation check waits for the cooldown deadline.
-  Successful and error responses also update a sanitized snapshot of Linear request, endpoint, and
-  complexity quota headers for `/api/v1/state`; authentication and other response headers are never
-  retained.
-- Request volume: candidate polling is skipped while all orchestrator agent slots are occupied,
-  preserving the most recent candidate counts. It continues when workers are unavailable so an
-  external capacity controller can detect new demand and wake them. Before dispatch, selected candidates are
-  revalidated in one ID-batched tracker request rather than one request per issue. Running and
-  blocked issue reconciliation also shares one ID-batched refresh per poll cycle. When Linear
-  reports request-quota headers, the next poll is delayed enough to spread an estimated two
-  requests per cycle across the remaining reset window; the configured interval remains the
-  minimum. The same shared limiter paces every Linear request across the remaining window and
-  reserves 10% of the hourly quota (at least 100 requests) instead of allowing concurrent agent
-  tools to exhaust it. Ordinary paced requests wait in one FIFO queue so multi-request operations
-  such as candidate discovery plus dispatch revalidation can finish without self-triggering a
-  synthetic rate-limit failure. Provider cooldowns and reserve exhaustion still fail locally with
-  the typed rate-limit error. Locally deferred and currently queued request counts plus the next
-  admission delay are exposed with the quota snapshot. The state API exposes the latest candidate
-  observation as `tracker` with `runnable_issues`, `blocked_issues`, and `observed_at`. It also
-  projects eligible candidates that were not assigned from that same fetch as `pending`, including
-  the first queued time, queue age, state lane, current lane occupants, and capacity reason; this
-  projection performs no additional tracker read. The worker-pool snapshot includes schedulable
-  non-drained hosts and available slots (it does not independently prove worker authentication).
-- Dispatch order: by default, lower priority, older creation time, and identifier remain the
-  ordering keys across all states. A workflow can set `agent.dispatch_state_order` to prioritize
-  only listed states (for example, `["Merging"]`). Within each state rank, configured
-  `agent.dispatch_priority_labels` are considered before tracker priority, creation time, and
-  identifier.
-  While any valid retry entry is pending, one global slot is reserved as a retry lane, so newly
-  discovered work cannot repeatedly take the last slot while existing work backs off. Retry
-  dispatch itself uses that ordinary global slot after consuming its retry entry. If the retry is
-  ready but capacity is unavailable, it returns to the scheduler-owned pending queue without
-  incrementing the failure attempt or creating another capacity retry timer.
+  human-readable provider detail.
 
 ### GitHub Issues adapter
 
@@ -355,8 +314,6 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
-- Pending eligible work shows queue age, state lane, current lane occupant, schedulable workers,
-  five-minute SLO breaches, and why each candidate is waiting
 
 ## Project Layout
 

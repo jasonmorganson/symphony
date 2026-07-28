@@ -25,12 +25,10 @@ defmodule SymphonyElixir.Tracker do
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
-  @callback rate_limit_snapshot() :: map() | nil
 
   @optional_callbacks agent_tool_specs: 0,
                       execute_agent_tool: 3,
-                      validate_config: 1,
-                      rate_limit_snapshot: 0
+                      validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -40,18 +38,6 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
-  end
-
-  @spec rate_limit_snapshot() :: map() | nil
-  def rate_limit_snapshot do
-    with {:ok, settings} <- Config.settings(),
-         {:ok, selected_adapter} <- adapter_for_kind(settings.tracker.kind),
-         true <- Code.ensure_loaded?(selected_adapter),
-         true <- function_exported?(selected_adapter, :rate_limit_snapshot, 0) do
-      selected_adapter.rate_limit_snapshot()
-    else
-      _ -> nil
-    end
   end
 
   @doc """

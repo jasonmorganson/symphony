@@ -86,13 +86,12 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   def handle_call(:force_reload, _from, %State{} = state) do
-    case load_state(Workflow.workflow_file_path()) do
+    case reload_state(state) do
       {:ok, new_state} ->
         {:reply, :ok, new_state}
 
-      {:error, reason} ->
-        log_reload_error(state.path, reason)
-        {:reply, {:error, reason}, state}
+      {:error, reason, new_state} ->
+        {:reply, {:error, reason}, new_state}
     end
   end
 

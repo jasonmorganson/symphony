@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.{AgentTool, Client, RateLimit}
+  alias SymphonyElixir.Linear.{AgentTool, Client}
   alias SymphonyElixir.Tracker.Issue
 
   @spec validate_config(map()) :: :ok | {:error, term()}
@@ -33,9 +33,6 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids), do: client_module().fetch_issues_by_ids(issue_ids)
-
-  @spec rate_limit_snapshot() :: map() | nil
-  def rate_limit_snapshot, do: RateLimit.snapshot()
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()

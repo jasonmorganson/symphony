@@ -30,15 +30,6 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
-  continuation_delay_ms_by_state:
-    Merging: 60000
-  max_concurrent_agents_by_state:
-    Merging: 3
-  dispatch_state_order:
-    - Merging
-  dispatch_priority_labels:
-    - production-gate
-    - main-ci
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -56,9 +47,7 @@ Follow-up context:
 - This is follow-up attempt #{{ attempt }}. It may be a normal continuation or a retry after a failure.
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
-- Do not hold a Codex worker merely to wait for an external system. Follow the external-wait
-  checkpoint protocol below; Symphony will resume the active issue after its configured
-  continuation delay.
+- Do not end the turn while the work item remains in an active state unless you are blocked by missing required access.
   {% endif %}
 
 Issue context:
@@ -107,79 +96,6 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
 
-## Shared-gate repair classification
-
-Use workflow-owned Linear writes to classify only issues that repair a shared gate:
-
-- Apply `main-ci` when the issue's explicit scope is repairing a deterministic failure on the
-  repository's protected default branch that blocks completion of other already-merged work.
-- Apply `production-gate` when the issue's explicit scope is repairing a deterministic deployment,
-  production audit, or release gate that blocks completion of other otherwise-ready issues.
-- If the current issue already has that explicit repair scope but lacks the matching label, add the
-  label during normal workpad reconciliation. Do not wait for an operator or mutate it from an
-  external monitor.
-- When filing a new shared-gate repair issue, include the matching label in the same workflow-owned
-  create/update sequence. Reuse an existing active owner for the same failure signature instead of
-  filing a duplicate.
-- Never infer a repair label merely because an ordinary issue observes a failing check. Require a
-  reproduced failure signature, proof that the repair is shared, and explicit repair acceptance
-  criteria on the owner issue.
-
-These labels are scheduler inputs: `production-gate` ranks before `main-ci`, and both rank before
-ordinary work within the same state. They do not bypass review, validation, or the serialized final
-merge writer.
-
-## External-wait checkpoint protocol
-
-Use this protocol when all currently actionable repository work is complete and progress depends
-only on an external asynchronous event such as GitHub checks, deployment verification, or a review:
-
-1. Query the external system once and record the exact identity being awaited (PR/head SHA, check
-   run or deployment ID, and current terminal/non-terminal status) in the workpad.
-2. Persist every local change, workpad update, and validation result needed for a later continuation.
-3. Call `symphony_merge_writer` with `{"action":"yield"}` and then end the turn without changing
-   the Linear state, sleeping, repeatedly polling, or treating the wait as a failure. The explicit
-   yield stops Symphony's normal back-to-back Codex continuation, releases any writer lease and the
-   authenticated worker, and schedules a later continuation for the still-active issue.
-4. On continuation, re-query once. If the event is still non-terminal, update its observation time
-   only when useful and yield cleanly again. If it is terminal, resume the matching workflow gate.
-
-Never use this protocol while an actionable diff, conflict, reviewer comment, or deterministic
-failure remains. Those require work in the current invocation.
-
-## Exact-state validation evidence
-
-Treat a successful local validation result as reusable evidence, not as a reason to rerun the same
-commands on every continuation. The single workpad is the durable evidence cache.
-
-Before running a local validation set, compute and record this identity:
-
-- `head_sha`: the full commit SHA being validated (`git rev-parse HEAD`);
-- `main_sha`: the full fetched default-branch SHA used as the comparison/merge base
-  (`git rev-parse origin/main` after `git fetch origin main`);
-- `config_digest`: SHA-256 of a canonical, newline-delimited manifest containing every command in
-  the validation set, its relevant arguments/environment mode, and the contents or blob SHAs of
-  configuration files that select or materially change those checks.
-
-Record successful evidence in the workpad `Validation` section with the exact identity, commands,
-terminal result, and observation time. Before rerunning a validation set, re-read that evidence and
-recompute all three identity fields. Reuse it only when:
-
-1. all three fields match exactly;
-2. every required command has a recorded successful terminal result;
-3. the working tree is clean, so no uncommitted input exists outside `head_sha`; and
-4. no ticket requirement, review request, or documented repository policy explicitly requires a
-   fresh execution.
-
-If reusable, cite the matching evidence in the workpad and continue without rerunning those local
-commands. Any changed head, fetched main, command set, environment mode, or relevant check
-configuration invalidates the evidence. Missing, partial, ambiguous, or failed evidence is never
-reusable.
-
-This optimization applies only to redundant local validation. It never replaces required GitHub
-checks, human review, deployment verification, exact-main verification after merge, or a targeted
-rerun needed to prove a new fix. Query those authoritative external gates for the exact current SHA.
-
 ## Related skills
 
 - `linear`: interact with Linear.
@@ -187,8 +103,6 @@ rerun needed to prove a new fix. Query those authoritative external gates for th
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
 - `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
-- `symphony_merge_writer`: acquire Symphony's singleton final-writer lease immediately before the
-  irreversible merge write and release it immediately after landing or before yielding.
 
 ## Status map
 
@@ -334,26 +248,7 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-   - Preparation is parallel: sync the branch, resolve conflicts, address review, validate, and
-     observe external checks without holding the final-writer lease.
-   - Once every final prerequisite is satisfied, call `symphony_merge_writer` with
-     `{"action":"acquire"}`. If it reports another owner, use the external-wait checkpoint protocol.
-   - After acquiring, revalidate the exact PR head, current base, approval, and required checks,
-     then execute the land skill's irreversible merge step.
-   - Call `symphony_merge_writer` with `{"action":"release"}` immediately after landing. If any
-     prerequisite becomes non-terminal or actionable repair is needed, release before continuing or
-     yielding. Process exit also releases the lease, but explicit release is required.
-6. During the land loop, use the external-wait checkpoint protocol whenever checks or deployment
-   verification are non-terminal. Do not occupy the serialized Merging worker by polling.
-7. If exact-main or post-merge verification fails:
-   - First prove whether the failure is attributable to this issue's merged diff.
-   - If attributable, repair it in this issue.
-   - If the same failure is proven to predate this merge and an active owner repair issue exists,
-     record the failing run and owner identifier in the workpad, leave this issue in `Merging`, and
-     yield cleanly. Do not duplicate the repair, falsely mark this issue `Done`, or poll while the
-     owner repair competes for capacity. Repair-priority dispatch allows that owner to run before
-     ordinary Merging continuations.
-8. After merge and all issue-owned post-merge gates are complete, move the issue to `Done`.
+6. After merge is complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
 

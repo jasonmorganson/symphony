@@ -5,480 +5,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.{Client, RateLimit}
 
-  test "full-capacity candidate polling reuses cached tracker counts without fetching" do
-    issue = %Issue{
-      id: "issue-running",
-      identifier: "A-RUNNING",
-      title: "Already running",
-      state: "In Progress",
-      dispatchable: true
-    }
-
-    state = %Orchestrator.State{
-      max_concurrent_agents: 1,
-      running: %{issue.id => %{issue: issue}},
-      tracker_counts: %{runnable_issues: 4, blocked_issues: 2, observed_at: ~U[2026-07-23 16:00:00Z]}
-    }
-
-    fetcher = fn _states ->
-      send(self(), :candidate_fetch_called)
-      {:ok, []}
-    end
-
-    assert {:skip, ^state} = Orchestrator.fetch_candidates_for_test(state, fetcher)
-    refute_receive :candidate_fetch_called
-  end
-
-  test "candidate polling continues with all workers drained so zero capacity can wake" do
-    state = %Orchestrator.State{
-      max_concurrent_agents: 1,
-      configured_worker_hosts: ["worker-0"],
-      drained_worker_hosts: MapSet.new(["worker-0"])
-    }
-
-    fetcher = fn states ->
-      send(self(), {:candidate_fetch_called, states})
-      {:ok, []}
-    end
-
-    assert {:ok, [], updated_state} =
-             Orchestrator.fetch_candidates_for_test(state, fetcher)
-
-    assert updated_state.tracker_counts.runnable_issues == 0
-    assert_receive {:candidate_fetch_called, _states}
-  end
-
-  test "candidate polling caches runnable and blocked issue counts" do
-    runnable = %Issue{
-      id: "issue-runnable",
-      identifier: "A-RUNNABLE",
-      title: "Runnable",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    blocked = %Issue{
-      id: "issue-blocked",
-      identifier: "A-BLOCKED",
-      title: "Blocked",
-      state: "Todo",
-      dispatchable: false
-    }
-
-    fetcher = fn _states -> {:ok, [runnable, blocked]} end
-
-    assert {:ok, [^runnable, ^blocked], updated_state} =
-             Orchestrator.fetch_candidates_for_test(
-               %Orchestrator.State{max_concurrent_agents: 5},
-               fetcher
-             )
-
-    assert %{
-             runnable_issues: 1,
-             blocked_issues: 1,
-             observed_at: %DateTime{}
-           } = updated_state.tracker_counts
-  end
-
-  test "candidate polling invalidates cached demand after a tracker error" do
-    state = %Orchestrator.State{
-      max_concurrent_agents: 1,
-      tracker_counts: %{runnable_issues: 0, blocked_issues: 0, observed_at: DateTime.utc_now()}
-    }
-
-    assert {:tracker_error, :unavailable, updated_state} =
-             Orchestrator.fetch_candidates_for_test(state, fn _states ->
-               {:error, :unavailable}
-             end)
-
-    assert updated_state.tracker_counts == nil
-  end
-
-  test "dispatch candidate revalidation batches selected issue ids into one fetch" do
-    first = %Issue{
-      id: "issue-1",
-      identifier: "A-1",
-      title: "First",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    second = %Issue{
-      id: "issue-2",
-      identifier: "A-2",
-      title: "Second",
-      state: "In Progress",
-      dispatchable: true
-    }
-
-    fetcher = fn ids ->
-      send(self(), {:dispatch_refresh_called, ids})
-      {:ok, [second, first]}
-    end
-
-    assert {:ok, [^first, ^second]} =
-             Orchestrator.revalidate_dispatch_candidates_for_test([first, second], fetcher)
-
-    assert_receive {:dispatch_refresh_called, ["issue-1", "issue-2"]}
-    refute_receive {:dispatch_refresh_called, _}
-  end
-
-  test "running and blocked issue reconciliation shares one tracker refresh" do
-    running_issue = %Issue{
-      id: "issue-running",
-      identifier: "A-RUNNING",
-      title: "Running",
-      state: "In Progress",
-      dispatchable: true
-    }
-
-    blocked_issue = %Issue{
-      id: "issue-blocked",
-      identifier: "A-BLOCKED",
-      title: "Blocked",
-      state: "Todo",
-      dispatchable: false
-    }
-
-    state = %Orchestrator.State{
-      running: %{running_issue.id => %{issue: running_issue}},
-      blocked: %{blocked_issue.id => %{issue: blocked_issue}}
-    }
-
-    fetcher = fn ids ->
-      send(self(), {:tracked_refresh_called, ids})
-      {:ok, [running_issue, blocked_issue]}
-    end
-
-    assert %Orchestrator.State{} =
-             Orchestrator.reconcile_tracked_issues_for_test(state, fetcher)
-
-    assert_receive {:tracked_refresh_called, ids}
-    assert MapSet.new(ids) == MapSet.new(["issue-running", "issue-blocked"])
-    refute_receive {:tracked_refresh_called, _}
-  end
-
-  test "Linear rate-limit telemetry records sanitized request, endpoint, and complexity headers" do
-    server = start_supervised!({RateLimit, name: Module.concat(__MODULE__, :TelemetryRateLimit)})
-
-    headers = [
-      {"x-ratelimit-requests-limit", "2500"},
-      {"x-ratelimit-requests-remaining", "17"},
-      {"x-ratelimit-requests-reset", "1784826153000"},
-      {"x-ratelimit-endpoint-name", "Issues"},
-      {"x-ratelimit-endpoint-requests-limit", "1000"},
-      {"x-ratelimit-endpoint-requests-remaining", "3"},
-      {"x-ratelimit-endpoint-requests-reset", "1784826153000"},
-      {"x-complexity", "412"},
-      {"x-ratelimit-complexity-limit", "3000000"},
-      {"x-ratelimit-complexity-remaining", "1200"},
-      {"x-ratelimit-complexity-reset", "1784826153000"},
-      {"authorization", "must-not-be-recorded"}
-    ]
-
-    assert :ok = RateLimit.observe(headers, server)
-
-    assert %{
-             observed_at: %DateTime{},
-             requests: %{limit: 2500, remaining: 17, reset_at_ms: 1_784_826_153_000},
-             endpoint: %{
-               name: "Issues",
-               limit: 1000,
-               remaining: 3,
-               reset_at_ms: 1_784_826_153_000
-             },
-             complexity: %{
-               query: 412,
-               limit: 3_000_000,
-               remaining: 1200,
-               reset_at_ms: 1_784_826_153_000
-             }
-           } = RateLimit.snapshot(server)
-
-    refute inspect(RateLimit.snapshot(server)) =~ "must-not-be-recorded"
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => 1_500,
-                 42 => "ignored"
-               },
-               server
-             )
-
-    assert %{requests: %{limit: 1_500}} = RateLimit.snapshot(server)
-
-    assert :ok =
-             RateLimit.observe(
-               [{"x-ratelimit-requests-limit", "invalid"}, :ignored],
-               server
-             )
-
-    assert %{requests: %{limit: 1_500}} = RateLimit.snapshot(server)
-  end
-
-  test "Linear request quota paces orchestration polling across the reset window" do
-    telemetry = %{requests: %{remaining: 100, reset_at_ms: 1_060_000}}
-
-    assert RateLimit.recommended_poll_delay_for_test(telemetry, 1_000, 2, 1_000_000) ==
-             1_200
-
-    assert RateLimit.recommended_poll_delay_for_test(telemetry, 30_000, 2, 1_000_000) ==
-             30_000
-
-    assert RateLimit.recommended_poll_delay_for_test(telemetry, 30_000, 2, 1_100_000) ==
-             30_000
-
-    assert RateLimit.recommended_poll_delay_for_test(nil, 30_000, 2, 1_000_000) ==
-             30_000
-  end
-
-  test "Linear admission paces every request and preserves a quota reserve" do
-    server =
-      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :PacingRateLimit), system_now_fun: fn -> 1_000_000 end})
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "2059",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               server
-             )
-
-    assert :ok = RateLimit.check(server)
-    queued_check = Task.async(fn -> RateLimit.check(server) end)
-    assert nil == Task.yield(queued_check, 10)
-
-    assert %{
-             admission: %{
-               deferred_requests: 1,
-               next_request_in_ms: next_request_in_ms,
-               queued_requests: 1
-             }
-           } = RateLimit.snapshot(server)
-
-    assert next_request_in_ms > 0
-    assert :ok = Task.await(queued_check, 200)
-
-    reserve_server =
-      start_supervised!(%{
-        id: :reserve_rate_limit,
-        start:
-          {RateLimit, :start_link,
-           [
-             [
-               name: Module.concat(__MODULE__, :ReserveRateLimit),
-               system_now_fun: fn -> 1_000_000 end
-             ]
-           ]}
-      })
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "250",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               reserve_server
-             )
-
-    assert {:error, {:linear_rate_limited, 60_000}} = RateLimit.check(reserve_server)
-    assert {:error, {:linear_rate_limited, 60_000}} = RateLimit.check(reserve_server)
-
-    reset_server =
-      start_supervised!(%{
-        id: :reset_window_rate_limit,
-        start:
-          {RateLimit, :start_link,
-           [
-             [
-               name: Module.concat(__MODULE__, :ResetWindowRateLimit),
-               system_now_fun: fn -> 1_060_000 end
-             ]
-           ]}
-      })
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "1",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               reset_server
-             )
-
-    assert :ok = RateLimit.check(reset_server)
-    assert :ok = RateLimit.check(reset_server)
-  end
-
-  test "adjacent Linear candidate and dispatch revalidation requests wait for admission" do
-    rate_limit_name = Module.concat(__MODULE__, :QueuedDispatchRateLimit)
-
-    start_supervised!({RateLimit, name: rate_limit_name, system_now_fun: fn -> 1_000_000 end})
-
-    {:ok, request_count} = Agent.start_link(fn -> 0 end)
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "2059",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               rate_limit_name
-             )
-
-    request_fun = fn _payload, _headers ->
-      Agent.update(request_count, &(&1 + 1))
-
-      {:ok,
-       %{
-         status: 200,
-         headers: %{
-           "x-ratelimit-requests-limit" => "2500",
-           "x-ratelimit-requests-remaining" => "2059",
-           "x-ratelimit-requests-reset" => "1060000"
-         },
-         body: %{"data" => %{}}
-       }}
-    end
-
-    assert {:ok, %{"data" => %{}}} =
-             Client.graphql("query Candidates { issues { nodes { id } } }", %{},
-               request_fun: request_fun,
-               rate_limit_server: rate_limit_name
-             )
-
-    assert {:ok, %{"data" => %{}}} =
-             Client.graphql("query Revalidate { issues { nodes { id } } }", %{},
-               request_fun: request_fun,
-               rate_limit_server: rate_limit_name
-             )
-
-    assert Agent.get(request_count, & &1) == 2
-
-    assert %{
-             admission: %{deferred_requests: 1, queued_requests: 0}
-           } = RateLimit.snapshot(rate_limit_name)
-  end
-
-  test "Linear admission releases queued callers in FIFO order" do
-    server =
-      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :FifoRateLimit), system_now_fun: fn -> 1_000_000 end})
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "2059",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               server
-             )
-
-    assert :ok = RateLimit.check(server)
-    parent = self()
-
-    first =
-      Task.async(fn ->
-        send(parent, {:admission_started, 1})
-        result = RateLimit.check(server)
-        send(parent, {:admission_released, 1})
-        result
-      end)
-
-    assert_receive {:admission_started, 1}
-    Process.sleep(5)
-
-    second =
-      Task.async(fn ->
-        send(parent, {:admission_started, 2})
-        result = RateLimit.check(server)
-        send(parent, {:admission_released, 2})
-        result
-      end)
-
-    assert_receive {:admission_started, 2}
-    Process.sleep(5)
-
-    assert %{admission: %{queued_requests: 2}} = RateLimit.snapshot(server)
-    send(server, {:release_waiter, make_ref()})
-    assert %{admission: %{queued_requests: 2}} = RateLimit.snapshot(server)
-
-    assert_receive {:admission_released, 1}, 200
-    refute_receive {:admission_released, 2}, 10
-    assert_receive {:admission_released, 2}, 200
-    assert :ok = Task.await(first)
-    assert :ok = Task.await(second)
-  end
-
-  test "Linear admission flushes queued callers on cooldown and reserve exhaustion" do
-    cooldown_server =
-      start_supervised!({RateLimit, name: Module.concat(__MODULE__, :QueuedCooldownRateLimit), system_now_fun: fn -> 1_000_000 end})
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "2059",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               cooldown_server
-             )
-
-    assert :ok = RateLimit.check(cooldown_server)
-    cooldown_waiter = Task.async(fn -> RateLimit.check(cooldown_server) end)
-    Process.sleep(5)
-    assert %{admission: %{queued_requests: 1}} = RateLimit.snapshot(cooldown_server)
-    assert :ok = RateLimit.activate(1_000, cooldown_server)
-
-    assert {:error, {:linear_rate_limited, remaining_ms}} = Task.await(cooldown_waiter)
-    assert remaining_ms > 0
-
-    reserve_server =
-      start_supervised!(%{
-        id: :queued_reserve_rate_limit,
-        start:
-          {RateLimit, :start_link,
-           [
-             [
-               name: Module.concat(__MODULE__, :QueuedReserveRateLimit),
-               system_now_fun: fn -> 1_000_000 end
-             ]
-           ]}
-      })
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "2059",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               reserve_server
-             )
-
-    assert :ok = RateLimit.check(reserve_server)
-    reserve_waiter = Task.async(fn -> RateLimit.check(reserve_server) end)
-    Process.sleep(5)
-
-    assert :ok =
-             RateLimit.observe(
-               %{
-                 "x-ratelimit-requests-limit" => "2500",
-                 "x-ratelimit-requests-remaining" => "250",
-                 "x-ratelimit-requests-reset" => "1060000"
-               },
-               reserve_server
-             )
-
-    assert {:error, {:linear_rate_limited, 60_000}} = Task.await(reserve_waiter, 200)
-  end
-
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -1114,114 +640,140 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
-  test "linear client records rate-limit telemetry from successful responses" do
-    rate_limit_name = Module.concat(__MODULE__, :SuccessfulResponseRateLimit)
-    start_supervised!({RateLimit, name: rate_limit_name})
+  test "linear client normalizes rate limits and shares the cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :LinearRateLimit)
+    start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
+    parent = self()
 
-    request_fun = fn _payload, _headers ->
-      {:ok,
-       %{
-         status: 200,
-         headers: %{
-           "x-ratelimit-requests-limit" => ["1,500"],
-           "x-ratelimit-requests-remaining" => ["1499"]
-         },
-         body: %{"data" => %{"viewer" => %{"id" => "viewer-1"}}}
-       }}
-    end
+    assert {:error, {:linear_rate_limited, 2_000}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 send(parent, :linear_request_sent)
 
-    assert {:ok, %{"data" => %{"viewer" => %{"id" => "viewer-1"}}}} =
-             Client.graphql("query Viewer { viewer { id } }", %{},
-               request_fun: request_fun,
-               rate_limit_server: rate_limit_name
+                 {:ok,
+                  %{
+                    status: 400,
+                    headers: %{"retry-after" => "2"},
+                    body: %{
+                      "errors" => [
+                        %{"extensions" => %{"code" => "RATELIMITED", "statusCode" => 429}}
+                      ]
+                    }
+                  }}
+               end
              )
 
-    assert %{requests: %{limit: 1_500, remaining: 1_499}} =
-             RateLimit.snapshot(rate_limit_name)
-  end
-
-  test "linear client converts semantic rate limits into one shared cooldown" do
-    rate_limit_name = Module.concat(__MODULE__, :TestLinearRateLimit)
-    start_supervised!({RateLimit, name: rate_limit_name})
-    {:ok, request_count} = Agent.start_link(fn -> 0 end)
-
-    request_fun = fn _payload, _headers ->
-      Agent.update(request_count, &(&1 + 1))
-
-      {:ok,
-       %{
-         status: 400,
-         headers: %{"retry-after" => ["1"]},
-         body: %{
-           "errors" => [
-             %{
-               "message" => "Rate limit exceeded.",
-               "extensions" => %{
-                 "code" => "RATELIMITED",
-                 "statusCode" => 429,
-                 "meta" => %{
-                   "rateLimitResult" => %{
-                     "allowed" => false,
-                     "duration" => 3_600_000,
-                     "limit" => 2_500,
-                     "remaining" => 0,
-                     "requested" => 1
-                   }
-                 }
-               }
-             }
-           ]
-         }
-       }}
-    end
-
-    assert {:error, {:linear_rate_limited, retry_after_ms}} =
-             Client.graphql("query Viewer { viewer { id } }", %{},
-               request_fun: request_fun,
-               rate_limit_server: rate_limit_name
-             )
-
-    assert retry_after_ms >= 1_000
-    assert Agent.get(request_count, & &1) == 1
+    assert_receive :linear_request_sent
 
     assert {:error, {:linear_rate_limited, remaining_ms}} =
-             Client.graphql("query Viewer { viewer { id } }", %{},
-               request_fun: request_fun,
-               rate_limit_server: rate_limit_name
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers -> flunk("cooldown must prevent the request") end
              )
 
-    assert remaining_ms > 0
-    assert Agent.get(request_count, & &1) == 1
+    assert remaining_ms in 1..2_000
   end
 
-  test "linear rate-limit cooldown expires, resets, and tolerates unavailable servers" do
-    rate_limit_name = Module.concat(__MODULE__, :TestLinearRateLimitLifecycle)
-    rate_limit_pid = start_supervised!({RateLimit, name: rate_limit_name})
+  test "linear client normalizes HTTP 429 and resumes after its cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :HttpLinearRateLimit)
+    start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
 
-    assert :ok = RateLimit.activate(0, rate_limit_pid)
-    Process.sleep(1)
-    assert :ok = RateLimit.check(rate_limit_pid)
+    assert {:error, {:linear_rate_limited, 0}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 429, headers: %{"retry-after" => "0"}, body: %{}}}
+               end
+             )
 
-    assert :ok = RateLimit.activate(60_000, rate_limit_name)
-
-    assert {:error, {:linear_rate_limited, remaining_ms}} =
-             RateLimit.check(rate_limit_name)
-
-    assert remaining_ms > 0
-    assert :ok = RateLimit.reset(rate_limit_name)
-    assert :ok = RateLimit.check(rate_limit_name)
-
-    unavailable = {:not, :a_server}
-    assert :ok = RateLimit.check(unavailable)
-    assert :ok = RateLimit.activate(1_000, unavailable)
-    assert :ok = RateLimit.observe(%{}, unavailable)
-    assert RateLimit.snapshot(unavailable) == nil
-    assert :ok = RateLimit.reset(unavailable)
+    assert {:ok, %{"data" => %{"viewer" => %{"id" => "recovered"}}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{"data" => %{"viewer" => %{"id" => "recovered"}}}
+                  }}
+               end
+             )
 
     assert :ok = RateLimit.activate(0)
     assert :ok = RateLimit.check()
-    assert :ok = RateLimit.observe(%{})
-    assert :ok = RateLimit.reset()
+  end
+
+  test "eligible demand includes active claims but excludes blocked issues" do
+    issues = [
+      %Issue{id: "ready", identifier: "MT-READY", title: "Ready", state: "Todo", dispatchable: true},
+      %Issue{
+        id: "claimed",
+        identifier: "MT-CLAIMED",
+        title: "Claimed",
+        state: "Todo",
+        dispatchable: true
+      },
+      %Issue{
+        id: "blocked",
+        identifier: "MT-BLOCKED",
+        title: "Blocked",
+        state: "Todo",
+        dispatchable: true
+      }
+    ]
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new(["claimed"]),
+      blocked: %{"blocked" => %{}}
+    }
+
+    assert %{eligible: 2, observed_at: %DateTime{}} =
+             Orchestrator.demand_from_issues_for_test(issues, state)
+  end
+
+  test "worker drain replacement survives orchestrator restart" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worker-drains-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      drain_path = Path.join(test_root, "worker-drains.json")
+      hosts = ["symphony-worker-0", "symphony-worker-1"]
+      orchestrator_name = Module.concat(__MODULE__, :DurableWorkerDrainOrchestrator)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        worker_ssh_hosts: hosts,
+        worker_drain_state_path: drain_path
+      )
+
+      {:ok, first_pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      assert {:ok, %{drained_hosts: ["symphony-worker-1"]}} =
+               Orchestrator.set_drained_worker_hosts(
+                 orchestrator_name,
+                 ["symphony-worker-1"]
+               )
+
+      GenServer.stop(first_pid)
+
+      {:ok, second_pid} = Orchestrator.start_link(name: orchestrator_name)
+      snapshot = Orchestrator.snapshot(orchestrator_name, 5_000)
+      assert snapshot.worker_pool.drained_hosts == ["symphony-worker-1"]
+      GenServer.stop(second_pid)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
@@ -1299,536 +851,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       ])
 
     assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
-  end
-
-  test "orchestrator preserves priority ordering across states by default" do
-    todo = %Issue{
-      id: "issue-todo",
-      identifier: "MT-300",
-      title: "Urgent todo",
-      state: "Todo",
-      priority: 1,
-      created_at: ~U[2025-01-01 00:00:00Z]
-    }
-
-    in_progress_newer = %Issue{
-      id: "issue-progress-new",
-      identifier: "MT-302",
-      title: "Newer in progress",
-      state: "In Progress",
-      priority: 2,
-      created_at: ~U[2026-01-02 00:00:00Z]
-    }
-
-    in_progress_older = %Issue{
-      id: "issue-progress-old",
-      identifier: "MT-301",
-      title: "Older in progress",
-      state: "In Progress",
-      priority: 2,
-      created_at: ~U[2026-01-01 00:00:00Z]
-    }
-
-    sorted =
-      Orchestrator.sort_issues_for_dispatch_for_test([
-        todo,
-        in_progress_newer,
-        in_progress_older
-      ])
-
-    assert Enum.map(sorted, & &1.identifier) == ["MT-300", "MT-301", "MT-302"]
-  end
-
-  test "configured dispatch state order prioritizes Merging and preserves order within it" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Todo", "Merging"],
-      dispatch_state_order: ["Merging"]
-    )
-
-    todo = %Issue{
-      id: "issue-todo",
-      identifier: "MT-400",
-      title: "Urgent todo",
-      state: "Todo",
-      priority: 1,
-      created_at: ~U[2025-01-01 00:00:00Z]
-    }
-
-    merging_newer = %Issue{
-      id: "issue-merging-new",
-      identifier: "MT-402",
-      title: "Newer merging",
-      state: "Merging",
-      priority: 2,
-      created_at: ~U[2026-01-02 00:00:00Z]
-    }
-
-    merging_older = %Issue{
-      id: "issue-merging-old",
-      identifier: "MT-401",
-      title: "Older merging",
-      state: "Merging",
-      priority: 2,
-      created_at: ~U[2026-01-01 00:00:00Z]
-    }
-
-    sorted =
-      Orchestrator.sort_issues_for_dispatch_for_test([
-        todo,
-        merging_newer,
-        merging_older
-      ])
-
-    assert Enum.map(sorted, & &1.identifier) == ["MT-401", "MT-402", "MT-400"]
-  end
-
-  test "configured priority labels advance gate repairs within the same state" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Merging"],
-      dispatch_state_order: ["Merging"],
-      dispatch_priority_labels: ["production-gate", "main-ci"]
-    )
-
-    ordinary = %Issue{
-      id: "ordinary",
-      identifier: "MT-500",
-      state: "Merging",
-      priority: 1,
-      labels: [],
-      created_at: ~U[2025-01-01 00:00:00Z]
-    }
-
-    main_ci = %Issue{
-      id: "main-ci",
-      identifier: "MT-502",
-      state: "Merging",
-      priority: 1,
-      labels: ["Main-CI"],
-      created_at: ~U[2026-01-01 00:00:00Z]
-    }
-
-    production_gate = %Issue{
-      id: "production-gate",
-      identifier: "MT-501",
-      state: "Merging",
-      priority: 4,
-      labels: ["production-gate"],
-      created_at: ~U[2026-01-02 00:00:00Z]
-    }
-
-    sorted =
-      Orchestrator.sort_issues_for_dispatch_for_test([ordinary, main_ci, production_gate])
-
-    assert Enum.map(sorted, & &1.identifier) == ["MT-501", "MT-502", "MT-500"]
-  end
-
-  test "pending projection reuses the last candidate observation and explains capacity" do
-    running = %Issue{
-      id: "issue-running",
-      identifier: "MT-RUNNING",
-      title: "Running",
-      state: "In Progress",
-      dispatchable: true
-    }
-
-    pending = %Issue{
-      id: "issue-pending",
-      identifier: "MT-PENDING",
-      title: "Pending",
-      state: "Todo",
-      priority: 2,
-      url: "https://example.org/issues/MT-PENDING",
-      dispatchable: true
-    }
-
-    observed_at = ~U[2026-07-24 12:00:00Z]
-
-    state = %Orchestrator.State{
-      max_concurrent_agents: 1,
-      running: %{running.id => %{issue: running}},
-      claimed: MapSet.new([running.id]),
-      tracker_counts: %{runnable_issues: 2, blocked_issues: 0, observed_at: observed_at}
-    }
-
-    updated =
-      Orchestrator.cache_pending_candidates_for_test(state, [running, pending])
-
-    assert %{
-             observed_at: ^observed_at,
-             issues: [
-               %{
-                 issue_id: "issue-pending",
-                 identifier: "MT-PENDING",
-                 issue_url: "https://example.org/issues/MT-PENDING",
-                 state: "Todo",
-                 priority: 2,
-                 reason: "orchestrator capacity full",
-                 refresh_status: "observed",
-                 queued_at: ^observed_at,
-                 lane: "Todo",
-                 lane_occupants: []
-               }
-             ]
-           } = updated.pending_candidates
-
-    later_observation = DateTime.add(observed_at, 600, :second)
-
-    recached =
-      updated
-      |> Map.put(:tracker_counts, %{runnable_issues: 2, blocked_issues: 0, observed_at: later_observation})
-      |> Orchestrator.cache_pending_candidates_for_test([running, pending])
-
-    assert recached.pending_candidates.observed_at == later_observation
-    assert recached.pending_candidates.issues |> List.first() |> Map.fetch!(:queued_at) == observed_at
-  end
-
-  test "pending projection removes a candidate refreshed into a terminal state" do
-    candidate = %Issue{
-      id: "issue-terminal",
-      identifier: "MT-TERMINAL",
-      title: "Terminal",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{max_concurrent_agents: 1}
-      |> Orchestrator.cache_pending_candidates_for_test([candidate])
-
-    terminal = %{candidate | state: "Done"}
-
-    assert {:ok, []} =
-             Orchestrator.revalidate_dispatch_candidates_for_test([candidate], fn _ids ->
-               {:ok, [terminal]}
-             end)
-
-    updated =
-      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
-        state,
-        [candidate],
-        []
-      )
-
-    assert updated.pending_candidates.issues == []
-  end
-
-  test "pending projection removes a candidate missing during dispatch refresh" do
-    candidate = %Issue{
-      id: "issue-missing",
-      identifier: "MT-MISSING",
-      title: "Missing",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{max_concurrent_agents: 1}
-      |> Orchestrator.cache_pending_candidates_for_test([candidate])
-
-    assert {:ok, []} =
-             Orchestrator.revalidate_dispatch_candidates_for_test([candidate], fn _ids ->
-               {:ok, []}
-             end)
-
-    updated =
-      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
-        state,
-        [candidate],
-        []
-      )
-
-    assert updated.pending_candidates.issues == []
-  end
-
-  test "pending projection uses refreshed state and fields" do
-    candidate = %Issue{
-      id: "issue-state-change",
-      identifier: "MT-OLD",
-      title: "Old title",
-      state: "Todo",
-      priority: 3,
-      dispatchable: true
-    }
-
-    running = %Issue{
-      id: "issue-running-capacity",
-      identifier: "MT-RUNNING",
-      title: "Running",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{
-        max_concurrent_agents: 1,
-        running: %{running.id => %{issue: running}},
-        claimed: MapSet.new([running.id])
-      }
-      |> Orchestrator.cache_pending_candidates_for_test([candidate])
-
-    refreshed = %{
-      candidate
-      | identifier: "MT-REFRESHED",
-        title: "Refreshed title",
-        state: "In Progress",
-        priority: 1,
-        url: "https://example.org/issues/MT-REFRESHED"
-    }
-
-    updated =
-      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
-        state,
-        [candidate],
-        [refreshed]
-      )
-
-    assert [
-             %{
-               issue_id: "issue-state-change",
-               identifier: "MT-REFRESHED",
-               issue_url: "https://example.org/issues/MT-REFRESHED",
-               state: "In Progress",
-               priority: 1,
-               reason: "orchestrator capacity full",
-               refresh_status: "refreshed"
-             }
-           ] = updated.pending_candidates.issues
-  end
-
-  test "pending projection recomputes retained reasons after filling global capacity" do
-    selected = %Issue{
-      id: "issue-selected-global",
-      identifier: "MT-SELECTED-GLOBAL",
-      title: "Selected",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    retained = %Issue{
-      id: "issue-retained-global",
-      identifier: "MT-RETAINED-GLOBAL",
-      title: "Retained",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{
-        max_concurrent_agents: 1,
-        running: %{selected.id => %{issue: selected}},
-        claimed: MapSet.new([selected.id])
-      }
-      |> Orchestrator.cache_pending_candidates_for_test([selected, retained])
-
-    updated =
-      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
-        state,
-        [selected],
-        [selected]
-      )
-
-    assert [%{issue_id: "issue-retained-global", reason: "orchestrator capacity full"}] =
-             updated.pending_candidates.issues
-  end
-
-  test "pending projection recomputes retained reasons after filling state capacity" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      max_concurrent_agents: 2,
-      max_concurrent_agents_by_state: %{"Todo" => 1}
-    )
-
-    selected = %Issue{
-      id: "issue-selected-state",
-      identifier: "MT-SELECTED-STATE",
-      title: "Selected",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    retained = %Issue{
-      id: "issue-retained-state",
-      identifier: "MT-RETAINED-STATE",
-      title: "Retained",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{
-        max_concurrent_agents: 2,
-        running: %{selected.id => %{issue: selected}},
-        claimed: MapSet.new([selected.id])
-      }
-      |> Orchestrator.cache_pending_candidates_for_test([selected, retained])
-
-    updated =
-      Orchestrator.reconcile_pending_candidates_after_refresh_for_test(
-        state,
-        [selected],
-        [selected]
-      )
-
-    assert [%{issue_id: "issue-retained-state", reason: "state concurrency limit reached"}] =
-             updated.pending_candidates.issues
-  end
-
-  test "pending projection marks every candidate skipped by a refresh error as stale" do
-    selected = %Issue{
-      id: "issue-refresh-error",
-      identifier: "MT-REFRESH-ERROR",
-      title: "Refresh error",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    skipped = %Issue{
-      id: "issue-refresh-skipped",
-      identifier: "MT-REFRESH-SKIPPED",
-      title: "Skipped after refresh error",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{max_concurrent_agents: 1}
-      |> Orchestrator.cache_pending_candidates_for_test([selected, skipped])
-
-    updated =
-      Orchestrator.mark_pending_refresh_failed_for_test(
-        state,
-        [selected],
-        [skipped],
-        :tracker_unavailable
-      )
-
-    assert Enum.map(updated.pending_candidates.issues, & &1.issue_id) ==
-             ["issue-refresh-error", "issue-refresh-skipped"]
-
-    assert Enum.all?(updated.pending_candidates.issues, fn entry ->
-             entry.refresh_status == "failed" and
-               entry.reason == "dispatch refresh failed: :tracker_unavailable"
-           end)
-  end
-
-  test "pending projection preserves capacity reasons outside an aborted refresh batch" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Todo", "Merging"],
-      max_concurrent_agents: 2,
-      max_concurrent_agents_by_state: %{"Merging" => 1}
-    )
-
-    running_merging = %Issue{
-      id: "issue-running-merging",
-      identifier: "MT-RUNNING-MERGING",
-      title: "Running merging",
-      state: "Merging",
-      dispatchable: true
-    }
-
-    blocked_merging = %Issue{
-      id: "issue-blocked-merging",
-      identifier: "MT-BLOCKED-MERGING",
-      title: "Blocked by state capacity",
-      state: "Merging",
-      dispatchable: true
-    }
-
-    selected_todo = %Issue{
-      id: "issue-selected-todo",
-      identifier: "MT-SELECTED-TODO",
-      title: "Selected todo",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{
-        max_concurrent_agents: 2,
-        running: %{running_merging.id => %{issue: running_merging}},
-        claimed: MapSet.new([running_merging.id])
-      }
-      |> Orchestrator.cache_pending_candidates_for_test([blocked_merging, selected_todo])
-
-    updated =
-      Orchestrator.mark_pending_refresh_failed_for_test(
-        state,
-        [selected_todo],
-        [],
-        :tracker_unavailable
-      )
-
-    assert [
-             %{
-               issue_id: "issue-blocked-merging",
-               reason: "state concurrency limit reached",
-               refresh_status: "observed"
-             },
-             %{
-               issue_id: "issue-selected-todo",
-               reason: "dispatch refresh failed: :tracker_unavailable",
-               refresh_status: "failed"
-             }
-           ] = updated.pending_candidates.issues
-  end
-
-  test "pending projection preserves capacity reasons for aborted remaining candidates" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Todo", "Merging"],
-      max_concurrent_agents: 2,
-      max_concurrent_agents_by_state: %{"Merging" => 1}
-    )
-
-    running_merging = %Issue{
-      id: "issue-running-merging-remaining",
-      identifier: "MT-RUNNING-MERGING-REMAINING",
-      title: "Running merging",
-      state: "Merging",
-      dispatchable: true
-    }
-
-    selected_todo = %Issue{
-      id: "issue-selected-todo-remaining",
-      identifier: "MT-SELECTED-TODO-REMAINING",
-      title: "Selected todo",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    remaining_merging = %Issue{
-      id: "issue-blocked-merging-remaining",
-      identifier: "MT-BLOCKED-MERGING-REMAINING",
-      title: "Blocked merging in remaining",
-      state: "Merging",
-      dispatchable: true
-    }
-
-    state =
-      %Orchestrator.State{
-        max_concurrent_agents: 2,
-        running: %{running_merging.id => %{issue: running_merging}},
-        claimed: MapSet.new([running_merging.id])
-      }
-      |> Orchestrator.cache_pending_candidates_for_test([selected_todo, remaining_merging])
-
-    updated =
-      Orchestrator.mark_pending_refresh_failed_for_test(
-        state,
-        [selected_todo],
-        [remaining_merging],
-        :tracker_unavailable
-      )
-
-    entries = Map.new(updated.pending_candidates.issues, &{&1.issue_id, &1})
-
-    assert %{
-             reason: "dispatch refresh failed: :tracker_unavailable",
-             refresh_status: "failed"
-           } = entries["issue-selected-todo-remaining"]
-
-    assert %{
-             reason: "state concurrency limit reached",
-             refresh_status: "observed"
-           } = entries["issue-blocked-merging-remaining"]
   end
 
   test "provider-marked blocked issue is not dispatch-eligible" do
@@ -2435,54 +1457,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.max_concurrent_agents_for_state("Closed") == 10
     assert Config.max_concurrent_agents_for_state(:not_a_string) == 10
 
-    drain_state_path = Path.join(System.tmp_dir!(), "worker-drains.json")
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      worker_max_concurrent_agents_per_host: 2,
-      worker_drain_state_path: drain_state_path
-    )
-
+    write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 2)
     assert :ok = Config.validate!()
     assert Config.settings!().worker.max_concurrent_agents_per_host == 2
-    assert Config.settings!().worker.drain_state_path == drain_state_path
-
-    previous_drain_path = System.get_env("SYMPHONY_TEST_DRAIN_PATH")
-    on_exit(fn -> restore_env("SYMPHONY_TEST_DRAIN_PATH", previous_drain_path) end)
-    System.put_env("SYMPHONY_TEST_DRAIN_PATH", "~/symphony-worker-drains.json")
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      worker_drain_state_path: "$SYMPHONY_TEST_DRAIN_PATH"
-    )
-
-    assert Config.settings!().worker.drain_state_path ==
-             Path.expand("~/symphony-worker-drains.json")
-
-    System.delete_env("SYMPHONY_TEST_DRAIN_PATH")
-    write_workflow_file!(Workflow.workflow_file_path(), worker_drain_state_path: "$SYMPHONY_TEST_DRAIN_PATH")
-    assert :ok = Config.validate!()
-    assert Config.settings!().worker.drain_state_path == nil
-  end
-
-  test "config validates and ranks explicit dispatch state order" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      dispatch_state_order: [" Merging ", "Human Review"]
-    )
-
-    assert Config.settings!().agent.dispatch_state_order == ["merging", "human review"]
-    assert Config.dispatch_state_rank("Merging") == 0
-    assert Config.dispatch_state_rank("Human Review") == 1
-    assert Config.dispatch_state_rank("Todo") == 2
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      dispatch_state_order: ["Merging", " merging "]
-    )
-
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "agent.dispatch_state_order"
-
-    write_workflow_file!(Workflow.workflow_file_path(), dispatch_state_order: [""])
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "agent.dispatch_state_order"
   end
 
   test "schema helpers cover custom type and state limit validation" do
@@ -2530,21 +1507,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "schema parse normalizes policy keys and env-backed fallbacks" do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
+    missing_drain_env = "SYMP_MISSING_DRAIN_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"
     missing_secret_env = "SYMP_MISSING_SECRET_#{System.unique_integer([:positive])}"
 
     previous_missing_workspace_env = System.get_env(missing_workspace_env)
+    previous_missing_drain_env = System.get_env(missing_drain_env)
     previous_empty_secret_env = System.get_env(empty_secret_env)
     previous_missing_secret_env = System.get_env(missing_secret_env)
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
     System.delete_env(missing_workspace_env)
+    System.delete_env(missing_drain_env)
     System.put_env(empty_secret_env, "")
     System.delete_env(missing_secret_env)
     System.put_env("LINEAR_API_KEY", "fallback-linear-token")
 
     on_exit(fn ->
       restore_env(missing_workspace_env, previous_missing_workspace_env)
+      restore_env(missing_drain_env, previous_missing_drain_env)
       restore_env(empty_secret_env, previous_empty_secret_env)
       restore_env(missing_secret_env, previous_missing_secret_env)
       restore_env("LINEAR_API_KEY", previous_linear_api_key)
@@ -2554,11 +1535,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Schema.parse(%{
                tracker: %{kind: "linear", api_key: "$#{empty_secret_env}"},
                workspace: %{root: "$#{missing_workspace_env}"},
+               worker: %{drain_state_path: "$#{missing_drain_env}"},
                codex: %{approval_policy: %{reject: %{sandbox_approval: true}}}
              })
 
     assert settings.tracker.api_key == nil
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert settings.worker.drain_state_path == nil
 
     assert settings.codex.approval_policy == %{
              "reject" => %{"sandbox_approval" => true}

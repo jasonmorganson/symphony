@@ -5,17 +5,14 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, MergeWriterTool, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
-          {:continue, Issue.t()}
-          | {:done, Issue.t()}
-          | {:defer, Issue.t(), non_neg_integer()}
-          | {:error, term()}
+          {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
     continue_with_issue?(issue, issue_state_fetcher)
@@ -88,15 +85,6 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp send_rate_limit_deferred(recipient, %Issue{id: issue_id}, retry_after_ms)
-       when is_binary(issue_id) and is_pid(recipient) and is_integer(retry_after_ms) and
-              retry_after_ms >= 0 do
-    send(recipient, {:agent_rate_limit_deferred, issue_id, retry_after_ms})
-    :ok
-  end
-
-  defp send_rate_limit_deferred(_recipient, _issue, _retry_after_ms), do: :ok
-
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
@@ -122,33 +110,6 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      continue_after_turn(
-        app_session,
-        workspace,
-        issue,
-        codex_update_recipient,
-        opts,
-        issue_state_fetcher,
-        turn_number,
-        max_turns
-      )
-    end
-  end
-
-  defp continue_after_turn(
-         app_session,
-         workspace,
-         issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         turn_number,
-         max_turns
-       ) do
-    if MergeWriterTool.take_yield_request() do
-      Logger.info("Agent requested clean yield for #{issue_context(issue)} after turn=#{turn_number}; returning control to orchestrator")
-      :ok
-    else
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
@@ -172,39 +133,13 @@ defmodule SymphonyElixir.AgentRunner do
         {:done, _refreshed_issue} ->
           :ok
 
-        {:defer, _refreshed_issue, retry_after_ms} ->
-          Logger.warning("Deferring issue state continuation for #{issue_context(issue)} because Linear is rate limited retry_after_ms=#{retry_after_ms}")
-          send_rate_limit_deferred(codex_update_recipient, issue, retry_after_ms)
-
-          :ok
-
         {:error, reason} ->
           {:error, reason}
       end
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    base_prompt = PromptBuilder.build_prompt(issue, opts)
-
-    case Keyword.get(opts, :operator_resume_reason) do
-      reason when is_binary(reason) and reason != "" ->
-        base_prompt <>
-          """
-
-          Operator-resume guidance:
-
-          - This is an explicitly invoked active issue turn for a ticket that was passive in Human Review.
-          - The operator reports that the external blocker has been resolved: #{reason}
-          - Re-read authoritative external evidence and the Linear issue before acting.
-          - If the blocker is actually resolved, follow the workflow's Human Review readiness-repair rule: move the issue to In Progress, update the existing workpad, and complete the remaining acceptance and validation gates.
-          - If the evidence does not prove resolution, leave the issue in Human Review and record only the concise remaining blocker in the existing workpad.
-          """
-
-      _ ->
-        base_prompt
-    end
-  end
+  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -229,10 +164,6 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:ok, []} ->
         {:done, issue}
-
-      {:error, {:linear_rate_limited, retry_after_ms}}
-      when is_integer(retry_after_ms) and retry_after_ms >= 0 ->
-        {:defer, issue, retry_after_ms}
 
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}

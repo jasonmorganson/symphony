@@ -8,7 +8,6 @@ defmodule SymphonyElixir.ExtensionsTest do
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
-  @worker_drain_token String.duplicate("d", 32)
 
   defmodule FakeLinearClient do
     def fetch_issues_by_states(states) do
@@ -60,23 +59,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
 
     def handle_call({:set_drained_worker_hosts, hosts}, _from, state) do
-      {:reply,
-       {:ok,
-        %{
-          configured_hosts: ["worker-a", "worker-b"],
-          drained_hosts: hosts,
-          active_drained_hosts: []
-        }}, state}
-    end
+      configured_hosts = state |> Keyword.fetch!(:snapshot) |> get_in([:worker_pool, :configured_hosts])
+      drained_hosts = Enum.sort(hosts)
 
-    def handle_call({:resume_issues, issues, reason}, _from, state) do
       {:reply,
        {:ok,
         %{
-          resumed: Enum.map(issues, & &1.identifier),
-          skipped: [],
-          requested_at: DateTime.utc_now(),
-          reason: reason
+          configured_hosts: configured_hosts,
+          drained_hosts: drained_hosts,
+          active_drained_hosts: []
         }}, state}
     end
   end
@@ -277,18 +268,27 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       )
 
-    start_test_endpoint(
-      orchestrator: orchestrator_name,
-      snapshot_timeout_ms: 50,
-      worker_drain_token: @worker_drain_token
-    )
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "pending" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "demand" => %{
+               "eligible" => 4,
+               "observed_at" => "2026-07-28T10:00:00Z"
+             },
+             "worker_pool" => %{
+               "configured" => 2,
+               "drained" => 1,
+               "available" => 1,
+               "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
+               "drained_hosts" => ["symphony-worker-1"],
+               "available_hosts" => ["symphony-worker-0"],
+               "available_slots" => 1
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -334,42 +334,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
-             "pending" => %{
-               "observed_at" => "2026-07-23T16:00:00Z",
-               "oldest_age_seconds" => state_payload["pending"]["oldest_age_seconds"],
-               "slo_breaches" => 1,
-               "issues" => [
-                 %{
-                   "issue_id" => "issue-pending",
-                   "issue_identifier" => "MT-PENDING",
-                   "issue_url" => "https://example.org/issues/MT-PENDING",
-                   "state" => "Merging",
-                   "priority" => 1,
-                   "reason" => "state concurrency limit reached",
-                   "refresh_status" => "observed",
-                   "queued_at" => state_payload["pending"]["issues"] |> List.first() |> Map.fetch!("queued_at"),
-                   "queue_age_seconds" =>
-                     state_payload["pending"]["issues"]
-                     |> List.first()
-                     |> Map.fetch!("queue_age_seconds"),
-                   "lane" => "Merging",
-                   "lane_occupants" => ["MT-MERGING"]
-                 }
-               ]
-             },
-             "merge_writer" => nil,
-             "worker_pool" => %{
-               "configured_hosts" => ["worker-a", "worker-b"],
-               "drained_hosts" => [],
-               "available_hosts" => ["worker-b"],
-               "available_slots" => 1
-             },
-             "tracker" => %{
-               "runnable_issues" => 5,
-               "blocked_issues" => 2,
-               "observed_at" => "2026-07-23T16:00:00Z"
-             },
-             "tracker_rate_limits" => nil,
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -438,96 +402,38 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
-
-    conn =
-      build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
-      |> put("/api/v1/worker-drains", %{"drained_worker_hosts" => ["worker-b"]})
-
-    assert json_response(conn, 200) == %{
-             "configured_hosts" => ["worker-a", "worker-b"],
-             "drained_hosts" => ["worker-b"],
-             "active_drained_hosts" => []
-           }
-
-    assert json_response(
-             put(build_conn(), "/api/v1/worker-drains", %{"drained_worker_hosts" => ["worker-b"]}),
-             401
-           )["error"]["code"] == "unauthorized"
-
-    invalid_conn =
-      build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
-      |> put("/api/v1/worker-drains", %{"drained_worker_hosts" => [%{"bad" => "host"}]})
-
-    assert json_response(invalid_conn, 422)["error"]["code"] == "invalid_worker_hosts"
   end
 
-  test "operator resume selectively dispatches authenticated Human Review issues" do
-    orchestrator_name = Module.concat(__MODULE__, :OperatorResumeOrchestrator)
+  test "worker drain updates require authorization and return the exact drain set" do
+    orchestrator_name = Module.concat(__MODULE__, :WorkerDrainApiOrchestrator)
 
-    {:ok, _pid} =
-      StaticOrchestrator.start_link(
-        name: orchestrator_name,
-        snapshot: static_snapshot()
-      )
-
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
-      %Issue{
-        id: "issue-review",
-        identifier: "MT-251",
-        state: "Human Review",
-        dispatchable: true
-      },
-      %Issue{
-        id: "issue-active",
-        identifier: "MT-252",
-        state: "In Progress",
-        dispatchable: true
-      }
-    ])
-
-    on_exit(fn -> Application.delete_env(:symphony_elixir, :memory_tracker_issues) end)
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: static_snapshot()})
 
     start_test_endpoint(
       orchestrator: orchestrator_name,
       snapshot_timeout_ms: 50,
-      worker_drain_token: @worker_drain_token
+      worker_drain_token: String.duplicate("d", 32)
     )
 
-    unauthorized =
-      post(build_conn(), "/api/v1/operator-resume", %{
-        "issue_identifiers" => ["MT-251"],
-        "reason" => "credential rotated"
-      })
+    assert json_response(
+             put(build_conn(), "/api/v1/worker-drains", %{
+               "drained_worker_hosts" => ["symphony-worker-1"]
+             }),
+             401
+           )["error"]["code"] == "unauthorized"
 
-    assert json_response(unauthorized, 401)["error"]["code"] == "unauthorized"
-
-    resumed =
+    conn =
       build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
-      |> post("/api/v1/operator-resume", %{
-        "issue_identifiers" => ["MT-251"],
-        "reason" => "credential rotated"
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> String.duplicate("d", 32))
+      |> put("/api/v1/worker-drains", %{
+        "drained_worker_hosts" => ["symphony-worker-1"]
       })
 
-    assert %{
-             "resumed" => ["MT-251"],
-             "skipped" => [],
-             "reason" => "credential rotated"
-           } = json_response(resumed, 202)
-
-    not_in_review =
-      build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer #{@worker_drain_token}")
-      |> post("/api/v1/operator-resume", %{
-        "issue_identifiers" => ["MT-252"],
-        "reason" => "credential rotated"
-      })
-
-    assert json_response(not_in_review, 409)["error"]["code"] ==
-             "issues_not_in_human_review"
+    assert json_response(conn, 200) == %{
+             "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
+             "drained_hosts" => ["symphony-worker-1"],
+             "active_drained_hosts" => []
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -655,16 +561,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
-    assert html =~ "MT-PENDING"
-    assert html =~ "Pending eligible work"
-    assert html =~ "state concurrency limit reached"
-    assert html =~ "Queue age"
-    assert html =~ "Lane occupant"
-    assert html =~ "MT-MERGING"
-    assert html =~ "Schedulable workers:"
-    assert html =~ "worker-b"
-    assert html =~ "queue SLO breaches"
-    assert html =~ "Observed at"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
@@ -672,8 +568,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
-    assert html =~ "Latest Codex and Linear tracker quota snapshots"
-    assert html =~ "Linear tracker"
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
@@ -774,13 +668,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-
-    assert response.body["counts"] == %{
-             "running" => 1,
-             "retrying" => 1,
-             "blocked" => 1,
-             "pending" => 1
-           }
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -872,33 +760,15 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
-      pending: %{
-        observed_at: ~U[2026-07-23 16:00:00Z],
-        issues: [
-          %{
-            issue_id: "issue-pending",
-            identifier: "MT-PENDING",
-            issue_url: "https://example.org/issues/MT-PENDING",
-            state: "Merging",
-            priority: 1,
-            reason: "state concurrency limit reached",
-            refresh_status: "observed",
-            queued_at: DateTime.add(DateTime.utc_now(), -360, :second),
-            lane: "Merging",
-            lane_occupants: ["MT-MERGING"]
-          }
-        ]
-      },
+      demand: %{eligible: 4, observed_at: ~U[2026-07-28 10:00:00Z]},
       worker_pool: %{
-        configured_hosts: ["worker-a", "worker-b"],
-        drained_hosts: [],
-        available_hosts: ["worker-b"],
+        configured: 2,
+        drained: 1,
+        available: 1,
+        configured_hosts: ["symphony-worker-0", "symphony-worker-1"],
+        drained_hosts: ["symphony-worker-1"],
+        available_hosts: ["symphony-worker-0"],
         available_slots: 1
-      },
-      tracker: %{
-        runnable_issues: 5,
-        blocked_issues: 2,
-        observed_at: ~U[2026-07-23 16:00:00Z]
       },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}

@@ -18,8 +18,6 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
-    assert config.agent.continuation_delay_ms_by_state == %{}
-    assert Config.continuation_delay_ms_for_state("In Review") == 1_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -35,21 +33,6 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      continuation_delay_ms_by_state: %{"In Review" => 300_000}
-    )
-
-    assert Config.settings!().agent.continuation_delay_ms_by_state == %{"in review" => 300_000}
-    assert Config.continuation_delay_ms_for_state("IN REVIEW") == 300_000
-    assert Config.continuation_delay_ms_for_state("In Progress") == 1_000
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      continuation_delay_ms_by_state: %{"In Review" => 0}
-    )
-
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "agent.continuation_delay_ms_by_state"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -147,12 +130,6 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
-    assert prompt =~ "Exact-state validation evidence"
-    assert prompt =~ "`head_sha`"
-    assert prompt =~ "`main_sha`"
-    assert prompt =~ "`config_digest`"
-    assert prompt =~ "working tree is clean"
-    assert prompt =~ "never replaces required GitHub"
   end
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
@@ -494,117 +471,6 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(second_worker_pid)
   end
 
-  test "a full dispatch batch leaves the orchestrator responsive with candidates remaining" do
-    issue_suffix = System.unique_integer([:positive])
-
-    test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-full-dispatch-batch-#{issue_suffix}"
-      )
-
-    hook_marker = Path.join(test_root, "before-run-started")
-    hook_fifo = Path.join(test_root, "before-run-blocker")
-    runtime_supervisor_name = Module.concat(__MODULE__, "BatchRuntime#{issue_suffix}")
-    task_supervisor_name = Module.concat(__MODULE__, "BatchTaskSupervisor#{issue_suffix}")
-    orchestrator_name = Module.concat(__MODULE__, "BatchOrchestrator#{issue_suffix}")
-    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
-
-    issues =
-      Enum.map(1..2, fn index ->
-        %Issue{
-          id: "issue-batch-#{issue_suffix}-#{index}",
-          identifier: "MT-#{issue_suffix}-#{index}",
-          title: "Dispatch batch issue #{index}",
-          description: "Keep one worker active while another candidate remains",
-          state: "In Progress",
-          url: "https://example.org/issues/MT-#{issue_suffix}-#{index}",
-          labels: [],
-          dispatchable: true
-        }
-      end)
-
-    on_exit(fn ->
-      if pid = Process.whereis(runtime_supervisor_name) do
-        GenServer.stop(pid)
-      end
-
-      restore_app_env(:memory_tracker_issues, previous_memory_issues)
-      restart_default_runtime!()
-      File.rm_rf(test_root)
-    end)
-
-    if Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
-      assert :ok =
-               Supervisor.terminate_child(
-                 SymphonyElixir.Supervisor,
-                 SymphonyElixir.AgentRuntimeSupervisor
-               )
-    end
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_kind: "memory",
-      workspace_root: test_root,
-      max_concurrent_agents: 1,
-      poll_interval_ms: 30_000,
-      hook_before_run: "mkfifo \"#{hook_fifo}\"; : > \"#{hook_marker}\"; read _ < \"#{hook_fifo}\"",
-      hook_timeout_ms: 60_000
-    )
-
-    Application.put_env(:symphony_elixir, :memory_tracker_issues, issues)
-
-    assert {:ok, runtime_supervisor_pid} =
-             SymphonyElixir.AgentRuntimeSupervisor.start_link(
-               name: runtime_supervisor_name,
-               task_supervisor_name: task_supervisor_name,
-               orchestrator_name: orchestrator_name
-             )
-
-    Process.unlink(runtime_supervisor_pid)
-    assert eventually_value(fn -> if File.exists?(hook_marker), do: true end)
-    assert is_map(Orchestrator.snapshot(orchestrator_name, 1_000))
-  end
-
-  test "new work preserves a dedicated slot while a valid retry is pending" do
-    issue = %Issue{
-      id: "new-candidate",
-      identifier: "MT-NEW",
-      title: "New candidate",
-      state: "Todo",
-      dispatchable: true
-    }
-
-    running = %{
-      "running-issue" => %{
-        issue: %Issue{id: "running-issue", state: "In Progress"},
-        worker_host: nil
-      }
-    }
-
-    state = %Orchestrator.State{
-      max_concurrent_agents: 2,
-      poll_interval_ms: 30_000,
-      running: running,
-      retry_attempts: %{
-        "retrying-issue" => %{
-          attempt: 3,
-          timer_ref: make_ref(),
-          retry_token: make_ref(),
-          due_at_ms: System.monotonic_time(:millisecond) + 300_000
-        }
-      }
-    }
-
-    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
-
-    malformed_retry_state =
-      put_in(state.retry_attempts["retrying-issue"], %{
-        due_at_ms: System.monotonic_time(:millisecond) + 1_000
-      })
-
-    assert Orchestrator.should_dispatch_issue_for_test(issue, malformed_retry_state)
-  end
-
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_ids([])
   end
@@ -934,132 +800,6 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
-  test "reconcile preserves an operator-resumed Human Review issue" do
-    issue_id = "issue-operator-resume"
-
-    agent_pid =
-      spawn(fn ->
-        receive do
-          :stop -> :ok
-        end
-      end)
-
-    state = %Orchestrator.State{
-      running: %{
-        issue_id => %{
-          pid: agent_pid,
-          ref: nil,
-          identifier: "MT-560",
-          operator_resume: true,
-          issue: %Issue{
-            id: issue_id,
-            identifier: "MT-560",
-            state: "Human Review",
-            dispatchable: true
-          },
-          started_at: DateTime.utc_now()
-        }
-      },
-      claimed: MapSet.new([issue_id]),
-      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-      retry_attempts: %{}
-    }
-
-    issue = %Issue{
-      id: issue_id,
-      identifier: "MT-560",
-      state: "Human Review",
-      title: "Operator resumed issue",
-      description: "The workflow still owns this passive-state session",
-      labels: [],
-      dispatchable: true
-    }
-
-    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
-
-    assert Map.has_key?(updated_state.running, issue_id)
-    assert MapSet.member?(updated_state.claimed, issue_id)
-    assert updated_state.running[issue_id].issue.state == "Human Review"
-    assert Process.alive?(agent_pid)
-
-    send(agent_pid, :stop)
-  end
-
-  test "merge writer lease serializes final writes and releases on agent crash" do
-    orchestrator_name = Module.concat(__MODULE__, "MergeWriter#{System.unique_integer([:positive])}")
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
-    end)
-
-    first = %Issue{id: "merge-1", identifier: "MT-1", state: "Merging"}
-    second = %Issue{id: "merge-2", identifier: "MT-2", state: "Merging"}
-    first_ref = make_ref()
-
-    :sys.replace_state(pid, fn state ->
-      %{
-        state
-        | startup_cleanup_ref: nil,
-          startup_cleanup_monitor_ref: nil,
-          running: %{
-            first.id => %{
-              issue: first,
-              identifier: first.identifier,
-              ref: first_ref,
-              pid: self(),
-              started_at: DateTime.utc_now(),
-              session_id: "session-1",
-              codex_app_server_pid: nil,
-              codex_input_tokens: 0,
-              codex_output_tokens: 0,
-              codex_total_tokens: 0,
-              last_codex_timestamp: nil,
-              last_codex_message: nil,
-              last_codex_event: nil
-            },
-            second.id => %{
-              issue: second,
-              identifier: second.identifier,
-              ref: make_ref(),
-              pid: self(),
-              started_at: DateTime.utc_now(),
-              session_id: "session-2",
-              codex_app_server_pid: nil,
-              codex_input_tokens: 0,
-              codex_output_tokens: 0,
-              codex_total_tokens: 0,
-              last_codex_timestamp: nil,
-              last_codex_message: nil,
-              last_codex_event: nil
-            }
-          },
-          claimed: MapSet.new([first.id, second.id])
-      }
-    end)
-
-    assert {:ok, %{acquired: true, issue_id: "merge-1"}} =
-             Orchestrator.acquire_merge_writer(pid, first)
-
-    assert %{merge_writer: %{issue_id: "merge-1", identifier: "MT-1"}} =
-             Orchestrator.snapshot(orchestrator_name, 1_000)
-
-    assert {:error, {:merge_writer_busy, "MT-1"}} =
-             Orchestrator.acquire_merge_writer(pid, second)
-
-    assert {:error, {:merge_writer_owned_by, "MT-1"}} =
-             Orchestrator.release_merge_writer(pid, second)
-
-    send(pid, {:DOWN, first_ref, :process, self(), :boom})
-
-    assert eventually_value(fn ->
-             case Orchestrator.acquire_merge_writer(pid, second) do
-               {:ok, %{acquired: true, issue_id: "merge-2"}} -> true
-               _ -> nil
-             end
-           end)
-  end
-
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
@@ -1213,62 +953,6 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
   end
 
-  test "capacity-bound retry returns to the scheduler queue without amplifying attempts" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Todo", "In Progress", "Human Review", "Merging"]
-    )
-
-    issue_id = "retry-capacity-bound"
-
-    issue = %Issue{
-      id: issue_id,
-      identifier: "MT-QUEUE",
-      title: "Wait for capacity",
-      state: "Merging",
-      priority: 1,
-      dispatchable: true,
-      labels: []
-    }
-
-    running_issue = %Issue{
-      id: "merging-occupant",
-      identifier: "MT-OCCUPANT",
-      title: "Current lane occupant",
-      state: "Merging",
-      labels: []
-    }
-
-    state = %Orchestrator.State{
-      max_concurrent_agents: 1,
-      running: %{
-        running_issue.id => %{
-          identifier: running_issue.identifier,
-          issue: running_issue,
-          worker_host: nil
-        }
-      },
-      claimed: MapSet.new([issue_id]),
-      retry_attempts: %{}
-    }
-
-    updated_state =
-      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 7, %{
-        identifier: issue.identifier,
-        error: "agent exited"
-      })
-
-    refute MapSet.member?(updated_state.claimed, issue_id)
-    refute Map.has_key?(updated_state.retry_attempts, issue_id)
-
-    assert %{issues: [pending]} = updated_state.pending_candidates
-    assert pending.issue_id == issue_id
-    assert pending.refresh_status == "capacity queue"
-    assert pending.reason == "orchestrator capacity full"
-    assert pending.lane == "Merging"
-    assert pending.lane_occupants == ["MT-OCCUPANT"]
-    assert %DateTime{} = pending.queued_at
-  end
-
   test "retry releases its claim when dispatch revalidation no longer finds the issue" do
     test_root =
       Path.join(
@@ -1335,50 +1019,6 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
-  test "agent runner defers a completed turn while Linear is rate limited" do
-    issue = %Issue{
-      id: "issue-linear-cooldown",
-      identifier: "MT-COOLDOWN",
-      title: "Preserve completed turn",
-      state: "In Progress"
-    }
-
-    fetcher = fn ["issue-linear-cooldown"] ->
-      {:error, {:linear_rate_limited, 60_000}}
-    end
-
-    assert {:defer, ^issue, 60_000} =
-             AgentRunner.continue_with_issue_for_test(issue, fetcher)
-  end
-
-  test "rate-limited retry poll preserves its attempt and shared cooldown" do
-    issue_id = "issue-retry-linear-cooldown"
-
-    state = %Orchestrator.State{
-      claimed: MapSet.new([issue_id]),
-      retry_attempts: %{}
-    }
-
-    updated_state =
-      Orchestrator.handle_retry_issue_for_test(
-        state,
-        issue_id,
-        7,
-        %{identifier: "MT-RETRY-COOLDOWN"},
-        fn ["issue-retry-linear-cooldown"] ->
-          {:error, {:linear_rate_limited, 60_000}}
-        end
-      )
-
-    assert %{
-             attempt: 7,
-             due_at_ms: due_at_ms,
-             error: "retry poll failed: {:linear_rate_limited, 60000}"
-           } = updated_state.retry_attempts[issue_id]
-
-    assert_due_in_range(due_at_ms, 59_000, 60_500)
-  end
-
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1417,115 +1057,6 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
-  end
-
-  test "rate-limited worker exit schedules one continuation check after the shared cooldown" do
-    issue_id = "issue-rate-limit-continuation"
-    ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :RateLimitContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-    end)
-
-    initial_state = :sys.get_state(pid)
-
-    running_entry = %{
-      pid: self(),
-      ref: ref,
-      identifier: "MT-RATE-LIMIT",
-      issue: %Issue{
-        id: issue_id,
-        identifier: "MT-RATE-LIMIT",
-        state: "In Progress"
-      },
-      started_at: DateTime.utc_now()
-    }
-
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
-
-    send(pid, {:agent_rate_limit_deferred, issue_id, 60_000})
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
-
-    refute Map.has_key?(state.running, issue_id)
-    assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms, error: nil} = state.retry_attempts[issue_id]
-    assert_due_in_range(due_at_ms, 59_000, 60_500)
-  end
-
-  test "normal worker exit uses the configured continuation delay for its issue state" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      continuation_delay_ms_by_state: %{"In Review" => 300_000}
-    )
-
-    issue_id = "issue-review-wait"
-    ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :ReviewContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :normal)
-    end)
-
-    initial_state = :sys.get_state(pid)
-
-    running_entry = %{
-      pid: self(),
-      ref: ref,
-      identifier: "MT-558-REVIEW",
-      issue: %Issue{id: issue_id, identifier: "MT-558-REVIEW", state: "In Review"},
-      started_at: DateTime.utc_now()
-    }
-
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
-
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
-
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert_due_in_range(due_at_ms, 299_000, 300_500)
-  end
-
-  test "continuation scheduling refreshes state after review-lane transitions" do
-    in_progress_entry = %{
-      issue: %Issue{id: "issue-enter-review", identifier: "MT-REVIEW", state: "In Progress"}
-    }
-
-    assert Orchestrator.continuation_issue_state_for_test(in_progress_entry, fn ["issue-enter-review"] ->
-             {:ok, [%Issue{id: "issue-enter-review", state: "In Review"}]}
-           end) == "In Review"
-
-    in_review_entry = %{
-      issue: %Issue{id: "issue-enter-merging", identifier: "MT-MERGE", state: "In Review"}
-    }
-
-    assert Orchestrator.continuation_issue_state_for_test(in_review_entry, fn ["issue-enter-merging"] ->
-             {:ok, [%Issue{id: "issue-enter-merging", state: "Merging"}]}
-           end) == "Merging"
-  end
-
-  test "continuation scheduling falls back to the running state when refresh fails" do
-    running_entry = %{
-      issue: %Issue{id: "issue-refresh-failed", identifier: "MT-FALLBACK", state: "In Review"}
-    }
-
-    assert Orchestrator.continuation_issue_state_for_test(running_entry, fn ["issue-refresh-failed"] ->
-             {:error, :timeout}
-           end) == "In Review"
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1722,20 +1253,6 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
-  end
-
-  test "select_worker_host_for_test excludes drained hosts including a preferred retry host" do
-    write_workflow_file!(Workflow.workflow_file_path(),
-      worker_ssh_hosts: ["worker-a", "worker-b"],
-      worker_max_concurrent_agents_per_host: 1
-    )
-
-    state = %Orchestrator.State{drained_worker_hosts: MapSet.new(["worker-a"])}
-
-    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-b"
-
-    all_drained = %{state | drained_worker_hosts: MapSet.new(["worker-a", "worker-b"])}
-    assert Orchestrator.select_worker_host_for_test(all_drained, nil) == :no_worker_capacity
   end
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
@@ -1992,13 +1509,6 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
     assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Shared-gate repair classification"
-    assert prompt =~ "lacks the matching label, add the"
-    assert prompt =~ "label during normal workpad reconciliation"
-    assert prompt =~ "External-wait checkpoint protocol"
-    assert prompt =~ ~s(`{"action":"yield"}`)
-    assert prompt =~ "releases any writer lease"
-    assert prompt =~ "the same failure is proven to predate this merge"
     assert prompt =~ "Only stop early for a true external blocker"
     assert prompt =~ "Do not include \"next steps for user\""
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"

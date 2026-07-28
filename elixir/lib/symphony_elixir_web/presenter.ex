@@ -16,16 +16,13 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, [])),
-            pending: snapshot |> pending_issues() |> length()
+            blocked: length(Map.get(snapshot, :blocked, []))
           },
+          demand: demand_payload(Map.get(snapshot, :demand)),
+          worker_pool: Map.get(snapshot, :worker_pool),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
-          pending: pending_payload(Map.get(snapshot, :pending)),
-          merge_writer: merge_writer_payload(Map.get(snapshot, :merge_writer)),
-          worker_pool: snapshot.worker_pool,
-          tracker: Map.get(snapshot, :tracker),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -36,14 +33,6 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
     end
-  end
-
-  defp merge_writer_payload(nil), do: nil
-
-  defp merge_writer_payload(%{acquired_at: %DateTime{} = acquired_at} = lease) do
-    lease
-    |> Map.take([:issue_id, :identifier])
-    |> Map.put(:acquired_at, DateTime.to_iso8601(acquired_at))
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
@@ -86,6 +75,13 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable -> {:error, :unavailable}
     end
   end
+
+  defp demand_payload(%{eligible: eligible, observed_at: observed_at})
+       when is_integer(eligible) and eligible >= 0 do
+    %{eligible: eligible, observed_at: iso8601(observed_at)}
+  end
+
+  defp demand_payload(_demand), do: %{eligible: 0, observed_at: nil}
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{
@@ -174,49 +170,6 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp)
     }
   end
-
-  defp pending_payload(%{observed_at: observed_at, issues: issues}) when is_list(issues) do
-    payload_issues = Enum.map(issues, &pending_entry_payload/1)
-
-    %{
-      observed_at: iso8601(observed_at),
-      issues: payload_issues,
-      oldest_age_seconds: payload_issues |> Enum.map(& &1.queue_age_seconds) |> Enum.max(fn -> 0 end),
-      slo_breaches: Enum.count(payload_issues, &(&1.queue_age_seconds >= 300))
-    }
-  end
-
-  defp pending_payload(_pending),
-    do: %{observed_at: nil, issues: [], oldest_age_seconds: 0, slo_breaches: 0}
-
-  defp pending_issues(snapshot) do
-    case Map.get(snapshot, :pending) do
-      %{issues: issues} when is_list(issues) -> issues
-      _ -> []
-    end
-  end
-
-  defp pending_entry_payload(entry) do
-    %{
-      issue_id: entry.issue_id,
-      issue_identifier: entry.identifier,
-      issue_url: Map.get(entry, :issue_url),
-      state: entry.state,
-      priority: Map.get(entry, :priority),
-      reason: entry.reason,
-      refresh_status: Map.get(entry, :refresh_status, "observed"),
-      queued_at: iso8601(Map.get(entry, :queued_at)),
-      queue_age_seconds: queue_age_seconds(Map.get(entry, :queued_at)),
-      lane: Map.get(entry, :lane, entry.state),
-      lane_occupants: Map.get(entry, :lane_occupants, [])
-    }
-  end
-
-  defp queue_age_seconds(%DateTime{} = queued_at) do
-    max(DateTime.diff(DateTime.utc_now(), queued_at, :second), 0)
-  end
-
-  defp queue_age_seconds(_queued_at), do: 0
 
   defp running_issue_payload(running) do
     %{

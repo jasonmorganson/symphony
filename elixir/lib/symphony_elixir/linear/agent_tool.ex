@@ -186,16 +186,6 @@ defmodule SymphonyElixir.Linear.AgentTool do
     }
   end
 
-  defp tool_error_payload({:linear_rate_limited, retry_after_ms}) do
-    %{
-      "error" => %{
-        "message" => "Linear is rate limited. Retry after the shared cooldown.",
-        "retryAfterMs" => retry_after_ms,
-        "status" => 429
-      }
-    }
-  end
-
   defp tool_error_payload({:linear_api_request, reason}) do
     %{
       "error" => %{

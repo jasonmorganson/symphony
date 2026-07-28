@@ -4,7 +4,7 @@ defmodule SymphonyElixir.MixProject do
   def project do
     [
       app: :symphony_elixir,
-      version: "0.0.1",
+      version: "0.0.2",
       elixir: "~> 1.19",
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       start_permanent: Mix.env() == :prod,
@@ -106,7 +106,7 @@ defmodule SymphonyElixir.MixProject do
   defp releases do
     [
       symphony: [
-        steps: release_steps(),
+        steps: [:assemble, &Burrito.wrap/1],
         burrito: [
           targets: [
             macos_arm64: [os: :darwin, cpu: :aarch64],
@@ -117,13 +117,5 @@ defmodule SymphonyElixir.MixProject do
         ]
       ]
     ]
-  end
-
-  defp release_steps do
-    if System.get_env("SYMPHONY_RELEASE_FORMAT") == "otp" do
-      [:assemble]
-    else
-      [:assemble, &Burrito.wrap/1]
-    end
   end
 end

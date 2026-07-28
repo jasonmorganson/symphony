@@ -5,7 +5,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
-  alias SymphonyElixir.Tracker
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -99,12 +98,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
-            <p class="metric-label">Pending</p>
-            <p class="metric-value numeric"><%= @payload.counts.pending %></p>
-            <p class="metric-detail">Last observed eligible issues waiting for capacity.</p>
-          </article>
-
-          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -122,70 +115,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Pending eligible work</h2>
-              <p class="section-copy">
-                Last observed eligible issues not yet assigned to a worker.
-                Observed at <span class="mono"><%= @payload.pending.observed_at || "n/a" %></span>.
-              </p>
-              <p class="section-copy">
-                Schedulable workers:
-                <span class="mono"><%= format_worker_hosts(@payload.worker_pool) %></span>
-                · available slots: <span class="mono"><%= Map.get(@payload.worker_pool, :available_slots, "n/a") %></span>
-                · queue SLO breaches (&gt;= 5m): <span class="mono"><%= @payload.pending.slo_breaches %></span>
-              </p>
-            </div>
-          </div>
-
-          <%= if @payload.pending.issues == [] do %>
-            <p class="empty-state">No eligible issues were waiting in the last candidate poll.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 960px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Lane</th>
-                    <th>Queue age</th>
-                    <th>Lane occupant</th>
-                    <th>Priority</th>
-                    <th>Observation</th>
-                    <th>Why pending</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.pending.issues}>
-                    <td>
-                      <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.lane)}>
-                        <%= entry.lane %>
-                      </span>
-                    </td>
-                    <td class="mono"><%= format_runtime_seconds(entry.queue_age_seconds) %></td>
-                    <td><%= format_lane_occupants(entry.lane_occupants) %></td>
-                    <td><%= entry.priority || "n/a" %></td>
-                    <td><%= entry.refresh_status %></td>
-                    <td><%= entry.reason %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
               <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest Codex and Linear tracker quota snapshots, when available.</p>
+              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
             </div>
           </div>
 
-          <p class="metric-label">Codex</p>
           <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
-          <p class="metric-label">Linear tracker</p>
-          <pre class="code-panel"><%= pretty_value(@payload.tracker_rate_limits) %></pre>
         </section>
 
         <section class="section-card">
@@ -395,13 +330,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp load_payload do
-    case Presenter.state_payload(orchestrator(), snapshot_timeout_ms()) do
-      %{error: _error} = payload ->
-        payload
-
-      payload ->
-        Map.put(payload, :tracker_rate_limits, Tracker.rate_limit_snapshot())
-    end
+    Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
   end
 
   defp orchestrator do
@@ -458,16 +387,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
         total + runtime_seconds_from_started_at(entry.started_at, now)
       end)
   end
-
-  defp format_worker_hosts(%{available_hosts: hosts}) when is_list(hosts) and hosts != [],
-    do: Enum.join(hosts, ", ")
-
-  defp format_worker_hosts(_worker_pool), do: "none"
-
-  defp format_lane_occupants(occupants) when is_list(occupants) and occupants != [],
-    do: Enum.join(occupants, ", ")
-
-  defp format_lane_occupants(_occupants), do: "none"
 
   defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"

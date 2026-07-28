@@ -3,20 +3,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   Dispatches client-side tool calls to the configured tracker adapter.
   """
 
-  alias SymphonyElixir.{MergeWriterTool, Tracker}
+  alias SymphonyElixir.Tracker
 
   @spec execute(String.t() | nil, term(), map(), keyword()) :: map()
   def execute(tool, arguments, binding, opts \\ []) do
-    if tool == MergeWriterTool.tool_name() do
-      MergeWriterTool.execute(arguments, opts)
-    else
-      Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
-    end
+    Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
   end
 
   @spec bind() :: map()
   def bind do
-    binding = Tracker.bind_agent_tools()
-    %{binding | tool_specs: binding.tool_specs ++ [MergeWriterTool.tool_spec()]}
+    Tracker.bind_agent_tools()
   end
 end

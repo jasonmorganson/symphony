@@ -289,10 +289,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `tracker_counts` (latest candidate-poll counts for runnable and blocked issues, plus observation time)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
-- tracker rate-limit telemetry (latest sanitized quota headers observed by the tracker adapter)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -458,15 +456,9 @@ Fields:
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
-- `continuation_delay_ms_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
-  - State keys are normalized (`lowercase`) for lookup.
-  - Blank state names and non-positive or non-integer values invalidate the
-    workflow configuration.
-- `dispatch_state_order` (list of state names, OPTIONAL extension)
-  - Default: empty list.
-  - When non-empty, listed states are ranked in list order before unlisted states.
-  - State names are normalized and MUST be unique and non-blank.
+  - State keys are normalized (`trim + lowercase`) for lookup.
+  - Invalid entries (non-positive or non-numeric) are ignored.
 
 #### 5.3.6 `codex` (object)
 
@@ -632,8 +624,6 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `agent.continuation_delay_ms_by_state`: map of positive integers, default `{}`; states not present use `1000`
-- `agent.dispatch_state_order`: optional ordered list of preferred states, default `[]`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -738,23 +728,20 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are REQUIRED before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states. It runs
-  as a supervised background task so remote cleanup hooks cannot block readiness or polling.
+- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop
 
-At startup, the service validates config, starts terminal cleanup in the background, schedules an
-immediate tick, and then repeats no sooner than `polling.interval_ms`. A tracker adapter MAY increase
-the delay using provider quota telemetry so polling consumes the remaining request budget gradually
-until its reset window.
+At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
+then repeats every `polling.interval_ms`.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
 
 Tick sequence:
 
-1. Reconcile running and blocked issues, batching compatible refreshes into one tracker request.
+1. Reconcile running issues.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
 4. Sort issues by dispatch priority.
@@ -763,20 +750,6 @@ Tick sequence:
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
-
-Tracker clients SHOULD recognize provider rate-limit errors even when an intermediary returns an
-HTTP status other than 429. While a provider cooldown is active, all tracker calls in the service
-MUST fail locally with a typed rate-limit error instead of consuming additional requests. A
-completed agent turn whose final issue-state refresh is rate limited MUST be deferred without
-turning the completed turn into an agent failure; its single continuation check SHOULD be delayed
-until the shared cooldown expires.
-
-When a tracker reports a remaining request quota and reset window, the client SHOULD pace all
-callers through one process-wide admission boundary and retain a bounded reserve for recovery and
-operator actions. Ordinary pacing SHOULD queue callers fairly rather than reject dependent
-requests within one logical operation. A caller rejected because a provider cooldown is active or
-the reserve has been reached MUST receive the same typed local rate-limit error without sending an
-upstream request.
 
 ### 8.2 Candidate Selection Rules
 
@@ -797,24 +770,15 @@ checked separately by the surrounding algorithm.
 
 Sorting order (stable intent):
 
-1. Optional configured state rank when the implementation exposes `agent.dispatch_state_order`;
-   unlisted states share the rank after listed states
-2. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
-3. `created_at` oldest first; null sorts last
-4. `identifier` lexicographic tie-breaker
-
-With the default empty state order, this is the standard priority, creation-time, and identifier
-ordering across all states.
+1. `priority` ascending for values `1..4`; all other integers and null sort after that bucket
+2. `created_at` oldest first; null sorts last
+3. `identifier` lexicographic tie-breaker
 
 ### 8.3 Concurrency Control
 
 Global limit:
 
 - `available_slots = max(max_concurrent_agents - running_count, 0)`
-- While any structurally valid retry entry is pending, candidate polling and new dispatch SHOULD
-  reserve one global slot as a retry lane. Retry dispatch itself uses the ordinary global limit
-  after removing its retry entry, preventing new work from repeatedly taking the reserved capacity
-  without reserving one slot per backoff entry.
 
 Per-state limit:
 
@@ -832,8 +796,7 @@ Retry entry creation:
 
 Backoff formula:
 
-- Normal continuation retries after a clean worker exit use
-  `agent.continuation_delay_ms_by_state[state]` when configured and otherwise `1000` ms.
+- Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
 
@@ -860,12 +823,8 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - the last meaningful Codex activity if any has been seen, else
+  - `last_codex_timestamp` if any event has been seen, else
   - `started_at`
-- Account and rate-limit control-plane notifications are observable telemetry, not meaningful
-  activity. Token-usage notifications count as activity only when a counter advances.
-- Preserve the last meaningful event and message separately so later telemetry cannot erase
-  operator-input or approval evidence.
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
@@ -1186,7 +1145,7 @@ Timeouts:
 - `codex.read_timeout_ms`: request/response timeout during startup and sync requests
 - `codex.turn_timeout_ms`: maximum silence interval while a turn stream is active; each
   app-server output resets it, so it is not a total turn runtime cap
-- `codex.stall_timeout_ms`: enforced by orchestrator based on meaningful agent inactivity
+- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
 
@@ -1435,13 +1394,6 @@ SHOULD return:
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
-- `pending` (the last candidate observation timestamp plus eligible-but-unassigned issue rows and
-  their first queued time, queue age, state lane, lane occupants, and capacity reason);
-  implementations SHOULD derive it from the candidate fetch already used for dispatch rather than
-  add a tracker request
-- `worker_pool` SHOULD distinguish configured and drained hosts from currently schedulable
-  non-drained hosts and available slots; schedulability alone MUST NOT be described as an
-  independent authentication proof
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`
   - `input_tokens`
@@ -1449,6 +1401,10 @@ SHOULD return:
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
+- Implementations that expose external worker-pool control MAY also include:
+  - `demand.eligible` and `demand.observed_at`, derived from the latest tracker poll
+  - configured, drained, and available worker hosts
+  - currently available worker-session slots
 
 RECOMMENDED snapshot error modes:
 
@@ -1549,6 +1505,8 @@ Minimum endpoints:
 - `GET /api/v1/state`
   - Returns a summary view of the current system state (running sessions, retry queue/delays,
     aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
+  - Implementations with an external worker pool MAY include the demand and worker-pool fields from
+    Section 13.3 without requiring another tracker request.
   - Suggested response shape:
 
     ```json
@@ -1593,20 +1551,7 @@ Minimum endpoints:
         "total_tokens": 7400,
         "seconds_running": 1834.2
       },
-      "rate_limits": null,
-      "tracker": {
-        "runnable_issues": 5,
-        "blocked_issues": 2,
-        "observed_at": "2026-02-24T20:15:00Z"
-      },
-      "tracker_rate_limits": {
-        "observed_at": "2026-02-24T20:15:00Z",
-        "requests": {
-          "limit": 1500,
-          "remaining": 1421,
-          "reset_at_ms": 1771965000000
-        }
-      }
+      "rate_limits": null
     }
     ```
 
@@ -1882,7 +1827,7 @@ function start_service():
     log_validation_error(validation)
     fail_startup(validation)
 
-  supervise_background(startup_terminal_workspace_cleanup)
+  startup_terminal_workspace_cleanup()
   schedule_tick(delay_ms=0)
 
   event_loop(state)
@@ -2098,8 +2043,10 @@ on_retry_timer(issue_id, state):
     return state
 
   if no_available_slots(state):
-    state.claimed.remove(issue_id)
-    return enqueue_pending_candidate(state, issue, reason="capacity queue")
+    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+      identifier: issue.identifier,
+      error: "no available orchestrator slots"
+    })
 
   return dispatch_issue(issue, state, attempt=retry_entry.attempt)
 ```
@@ -2176,13 +2123,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   portable error mapping
 - Error mapping covers config, request, non-success response, malformed payload, pagination, and
   rate limiting, including documented category/message mappings for language-native errors
-- Provider-native rate-limit payloads map to the rate-limit category even when their HTTP wrapper
-  status differs, and repeated requests share a process-wide cooldown
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
-- Dispatch sort order is priority then oldest creation time by default; an optional explicit state
-  preference ranks only configured states first
+- Dispatch sort order is priority then oldest creation time
 - `dispatchable=false` issues are not eligible
 - Required-label filtering is case-insensitive and applies after adapter normalization
 - Active-state issue refresh updates running entry state
@@ -2193,8 +2137,6 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
-- Rate-limited final state refresh defers the completed turn and schedules its continuation check
-  for the shared cooldown deadline without escalating the failure attempt
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
@@ -2323,8 +2265,8 @@ Extension config:
   - When omitted, work runs locally.
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
   - Shared per-host cap applied across configured SSH hosts.
-- `worker.drain_state_path` (path, OPTIONAL)
-  - Durable scheduler-owned worker drain state used by authenticated control-plane updates.
+- `worker.drain_state_path` (path string, OPTIONAL)
+  - Durable exact set of SSH hosts excluded from new dispatches.
 
 ### A.1 Execution Model
 
@@ -2348,12 +2290,10 @@ Extension config:
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
-- Hosts in the scheduler-owned drain set are excluded from new dispatch, including preferred retry
-  placement. Updating the drain set is serialized with dispatch and persisted before acknowledgment
-  when `worker.drain_state_path` is configured.
-- The worker-drain mutation endpoint requires `SYMPHONY_WORKER_DRAIN_TOKEN`. A configured missing,
-  unreadable, or invalid drain-state file fails closed by draining all configured hosts until an
-  authenticated control-plane reconciliation succeeds.
+- Drained hosts MUST remain ineligible for new dispatches, while active sessions already assigned
+  to a newly drained host continue under the normal session lifecycle.
+- An implementation exposing remote drain control SHOULD replace the complete durable drain set
+  atomically, validate hosts against `worker.ssh_hosts`, and authenticate mutation requests.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - Implementations MAY fail over to another host when the original host is unavailable before work

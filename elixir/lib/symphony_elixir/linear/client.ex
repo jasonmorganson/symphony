@@ -152,9 +152,11 @@ defmodule SymphonyElixir.Linear.Client do
     with {:ok, headers} <- graphql_headers(tracker_settings),
          :ok <- RateLimit.check(rate_limit_server) do
       case request_fun.(payload, headers) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
+
         {:ok, response} ->
-          :ok = RateLimit.observe(Map.get(response, :headers, []), rate_limit_server)
-          handle_response(payload, response, rate_limit_server)
+          handle_error_response(payload, response, rate_limit_server)
 
         {:error, reason} ->
           Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
@@ -163,12 +165,6 @@ defmodule SymphonyElixir.Linear.Client do
     else
       {:error, reason} -> {:error, reason}
     end
-  end
-
-  defp handle_response(_payload, %{status: 200, body: body}, _rate_limit_server), do: {:ok, body}
-
-  defp handle_response(payload, response, rate_limit_server) do
-    handle_error_response(payload, response, rate_limit_server)
   end
 
   @doc false
@@ -361,8 +357,8 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp rate_limit_retry_after_ms(%{body: body} = response) when is_map(body) do
-    if rate_limited_body?(body) do
+  defp rate_limit_retry_after_ms(%{status: status} = response) do
+    if status == 429 or rate_limited_body?(Map.get(response, :body)) do
       {:ok, retry_after_header_ms(response) || default_rate_limit_cooldown_ms()}
     else
       :error
@@ -383,13 +379,40 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp rate_limited_body?(_body), do: false
 
+  defp retry_after_header_ms(%Req.Response{} = response) do
+    response
+    |> Req.Response.get_header("retry-after")
+    |> List.first()
+    |> parse_retry_after_ms()
+  end
+
   defp retry_after_header_ms(%{headers: headers}) do
     headers
-    |> RateLimit.header_value("retry-after")
+    |> header_value("retry-after")
     |> parse_retry_after_ms()
   end
 
   defp retry_after_header_ms(_response), do: nil
+
+  defp header_value(headers, name) when is_map(headers) do
+    case Map.get(headers, name) || Map.get(headers, String.downcase(name)) do
+      [value | _] when is_binary(value) -> value
+      value when is_binary(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp header_value(headers, name) when is_list(headers) do
+    Enum.find_value(headers, fn
+      {header_name, value} when is_binary(header_name) and is_binary(value) ->
+        if String.downcase(header_name) == name, do: value
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp header_value(_headers, _name), do: nil
 
   defp parse_retry_after_ms(value) when is_binary(value) do
     case Integer.parse(String.trim(value)) do
