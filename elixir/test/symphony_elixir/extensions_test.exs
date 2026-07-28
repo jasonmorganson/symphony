@@ -21,6 +21,31 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule FakeReclamationClient do
+    alias SymphonyElixir.{Config, Tracker.Issue}
+
+    def fetch_issues_by_ids([first, second]) do
+      settings = Config.settings!().tracker
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      {:ok,
+       [
+         %Issue{
+           id: first,
+           identifier: first,
+           state: hd(settings.terminal_states),
+           updated_at: now
+         },
+         %Issue{
+           id: second,
+           identifier: second,
+           state: hd(settings.active_states),
+           updated_at: now
+         }
+       ]}
+    end
+  end
+
   defmodule SlowOrchestrator do
     use GenServer
 
@@ -434,6 +459,41 @@ defmodule SymphonyElixir.ExtensionsTest do
              "drained_hosts" => ["symphony-worker-1"],
              "active_drained_hosts" => []
            }
+  end
+
+  test "workspace reclamation proxies normalized terminal state without exposing tracker credentials" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeReclamationClient)
+    start_test_endpoint(worker_drain_token: String.duplicate("r", 32))
+
+    assert json_response(
+             post(build_conn(), "/api/v1/workspace-reclamation", %{
+               "issue_identifiers" => ["A-218", "A-222"]
+             }),
+             401
+           )["error"]["code"] == "unauthorized"
+
+    response =
+      build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> String.duplicate("r", 32))
+      |> post("/api/v1/workspace-reclamation", %{
+        "issue_identifiers" => ["A-218", "A-222"]
+      })
+      |> json_response(200)
+
+    assert [
+             %{
+               "issue_identifier" => "A-218",
+               "terminal" => true,
+               "terminal_at" => terminal_at
+             },
+             %{
+               "issue_identifier" => "A-222",
+               "terminal" => false,
+               "terminal_at" => nil
+             }
+           ] = response["issues"]
+
+    assert {:ok, _terminal_at, 0} = DateTime.from_iso8601(terminal_at)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
