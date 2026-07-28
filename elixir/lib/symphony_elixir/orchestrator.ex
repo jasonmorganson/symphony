@@ -1242,19 +1242,23 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
   defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
-      {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+    if System.get_env("SYMPHONY_EXTERNAL_WORKSPACE_RECLAIMER") == "true" do
+      Logger.info("Skipping startup terminal workspace cleanup; external reclaimer is configured")
+    else
+      case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+        {:ok, issues} ->
+          issues
+          |> Enum.each(fn
+            %Issue{} = issue ->
+              cleanup_issue_workspace(issue)
 
-          _ ->
-            :ok
-        end)
+            _ ->
+              :ok
+          end)
 
-      {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        {:error, reason} ->
+          Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+      end
     end
   end
 
