@@ -45,6 +45,8 @@ defmodule SymphonyElixir.Orchestrator do
       drain_state_path: nil,
       demand_eligible: 0,
       demand_observed_at: nil,
+      observed_issues: [],
+      observed_issues_observed_at: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -314,11 +316,20 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
-      state = observe_demand(state, issues)
+         config = Config.settings!(),
+         {:ok, issues} <-
+           Tracker.fetch_issues_by_states(Enum.uniq(config.tracker.active_states ++ config.tracker.observed_states)) do
+      active_states = active_state_set()
+      observed_states = issue_state_set(config.tracker.observed_states)
+      {active_issues, observed_issues} = partition_issues(issues, active_states, observed_states)
+
+      state =
+        state
+        |> observe_demand(active_issues)
+        |> observe_issues(observed_issues)
 
       if available_slots(state) > 0 do
-        choose_issues(issues, state)
+        choose_issues(active_issues, state)
       else
         state
       end
@@ -1027,10 +1038,36 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp active_state_set do
-    Config.settings!().tracker.active_states
+    issue_state_set(Config.settings!().tracker.active_states)
+  end
+
+  defp issue_state_set(states) when is_list(states) do
+    states
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
+  end
+
+  @doc false
+  @spec partition_issues_for_test([Issue.t()], [String.t()], [String.t()]) ::
+          {[Issue.t()], [Issue.t()]}
+  def partition_issues_for_test(issues, active_states, observed_states) do
+    partition_issues(issues, issue_state_set(active_states), issue_state_set(observed_states))
+  end
+
+  defp partition_issues(issues, active_states, observed_states) do
+    Enum.reduce(issues, {[], []}, fn issue, {active, observed} ->
+      cond do
+        active_issue_state?(issue.state, active_states) -> {[issue | active], observed}
+        active_issue_state?(issue.state, observed_states) -> {active, [issue | observed]}
+        true -> {active, observed}
+      end
+    end)
+    |> then(fn {active, observed} -> {Enum.reverse(active), Enum.reverse(observed)} end)
+  end
+
+  defp observe_issues(state, observed_issues) do
+    %{state | observed_issues: observed_issues, observed_issues_observed_at: DateTime.utc_now()}
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
@@ -1652,6 +1689,10 @@ defmodule SymphonyElixir.Orchestrator do
        demand: %{
          eligible: state.demand_eligible,
          observed_at: state.demand_observed_at
+       },
+       observed: %{
+         issues: state.observed_issues,
+         observed_at: state.observed_issues_observed_at
        },
        worker_pool: %{
          configured: length(state.configured_worker_hosts),

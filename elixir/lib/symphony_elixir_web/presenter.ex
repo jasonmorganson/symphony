@@ -16,9 +16,11 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            observed: snapshot |> Map.get(:observed, %{}) |> Map.get(:issues, []) |> length()
           },
           demand: demand_payload(Map.get(snapshot, :demand)),
+          observed: observed_payload(Map.get(snapshot, :observed)),
           worker_pool: Map.get(snapshot, :worker_pool),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
@@ -82,6 +84,33 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp demand_payload(_demand), do: %{eligible: 0, observed_at: nil}
+
+  defp observed_payload(%{issues: issues, observed_at: observed_at}) when is_list(issues) do
+    now = DateTime.utc_now()
+
+    %{
+      observed_at: iso8601(observed_at),
+      issues: Enum.map(issues, &observed_issue_payload(&1, now))
+    }
+  end
+
+  defp observed_payload(_observed), do: %{observed_at: nil, issues: []}
+
+  defp observed_issue_payload(issue, now) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      state: issue.state,
+      url: issue.url,
+      updated_at: iso8601(issue.updated_at),
+      age_seconds: age_seconds(issue.updated_at, now)
+    }
+  end
+
+  defp age_seconds(%DateTime{} = updated_at, %DateTime{} = now),
+    do: max(DateTime.diff(now, updated_at, :second), 0)
+
+  defp age_seconds(_updated_at, _now), do: nil
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{

@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.{Client, RateLimit}
+  alias SymphonyElixir.{Orchestrator, Tracker.Issue}
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -739,6 +740,23 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              Orchestrator.demand_from_issues_for_test(issues, state)
   end
 
+  test "observed tracker states are visible but never enter the active issue partition" do
+    issues = [
+      %Issue{id: "active", identifier: "MT-ACTIVE", state: "Todo"},
+      %Issue{id: "review", identifier: "MT-REVIEW", state: "Human Review"}
+    ]
+
+    assert {[active], [observed]} =
+             Orchestrator.partition_issues_for_test(
+               issues,
+               ["Todo", "In Progress"],
+               ["Human Review"]
+             )
+
+    assert active.identifier == "MT-ACTIVE"
+    assert observed.identifier == "MT-REVIEW"
+  end
+
   test "worker drain replacement survives orchestrator restart" do
     test_root =
       Path.join(
@@ -1360,6 +1378,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "assignee" => nil,
              "extra" => %{"team" => "platform"}
            }
+  end
+
+  test "schema preserves read-only observed tracker states separately from active states" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 active_states: ["Todo", "In Progress"],
+                 observed_states: ["Human Review"]
+               }
+             })
+
+    assert settings.tracker.active_states == ["Todo", "In Progress"]
+    assert settings.tracker.observed_states == ["Human Review"]
   end
 
   test "linear adapter rejects invalid provider values without crashing config parsing" do
