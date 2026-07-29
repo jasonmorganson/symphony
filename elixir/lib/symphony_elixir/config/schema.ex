@@ -57,6 +57,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
+      field(:observed_states, {:array, :string}, default: [])
       field(:terminal_states, {:array, :string})
     end
 
@@ -74,6 +75,7 @@ defmodule SymphonyElixir.Config.Schema do
           :provider,
           :required_labels,
           :active_states,
+          :observed_states,
           :terminal_states
         ],
         empty_values: []
