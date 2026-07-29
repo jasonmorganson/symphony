@@ -207,14 +207,21 @@ codex:
 - `worker.drain_state_path` enables exact durable worker drains. When configured, a missing or
   invalid drain file fails closed by draining every configured worker until an authenticated
   replacement succeeds.
+- `worker.affinity_state_path` atomically records the SSH host that owns each issue workspace.
+  When configured, Symphony refuses to start from corrupt affinity state and waits for an assigned
+  host instead of dispatching the issue to a different worker after a restart.
+- `worker.affinity_seed_path` optionally provides a prevalidated one-time migration seed. Symphony
+  reads and atomically promotes it only when the durable affinity registry does not yet exist.
 
 ### Kubernetes autoscaling extensions
 
 This fork keeps upstream orchestration and adds a small authenticated surface for an external
 Kubernetes controller:
 
-- `GET /api/v1/state` includes cached `demand.eligible`, `demand.observed_at`, and `worker_pool`
-  counts. Demand is calculated from the candidate list already fetched by the normal poll.
+- `GET /api/v1/state` includes cached `demand.eligible`, `demand.observed_at`, worker affinity
+  entries, and `worker_pool` counts. `worker_pool.required_hosts` lets an external autoscaler keep
+  every durable workspace owner available. Demand is calculated from the candidate list already
+  fetched by the normal poll.
 - `PUT /api/v1/worker-drains` replaces the exact durable drain set. It requires
   `Authorization: Bearer <SYMPHONY_WORKER_DRAIN_TOKEN>` with a token of at least 32 bytes and
   returns configured, drained, and still-active drained hosts.

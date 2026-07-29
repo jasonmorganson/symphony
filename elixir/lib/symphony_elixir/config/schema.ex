@@ -133,12 +133,24 @@ defmodule SymphonyElixir.Config.Schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
       field(:drain_state_path, :string)
+      field(:affinity_state_path, :string)
+      field(:affinity_seed_path, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host, :drain_state_path], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :ssh_hosts,
+          :max_concurrent_agents_per_host,
+          :drain_state_path,
+          :affinity_state_path,
+          :affinity_seed_path
+        ],
+        empty_values: []
+      )
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
     end
   end
@@ -459,7 +471,9 @@ defmodule SymphonyElixir.Config.Schema do
 
     worker = %{
       settings.worker
-      | drain_state_path: resolve_optional_path_value(settings.worker.drain_state_path)
+      | drain_state_path: resolve_optional_path_value(settings.worker.drain_state_path),
+        affinity_state_path: resolve_optional_path_value(settings.worker.affinity_state_path),
+        affinity_seed_path: resolve_optional_path_value(settings.worker.affinity_seed_path)
     }
 
     codex = %{

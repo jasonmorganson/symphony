@@ -22,6 +22,7 @@ defmodule SymphonyElixirWeb.Presenter do
           demand: demand_payload(Map.get(snapshot, :demand)),
           observed: observed_payload(Map.get(snapshot, :observed)),
           worker_pool: Map.get(snapshot, :worker_pool),
+          worker_affinities: Map.get(snapshot, :worker_affinities, []),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
