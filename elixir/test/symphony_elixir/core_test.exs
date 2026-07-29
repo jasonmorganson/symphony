@@ -1102,7 +1102,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 299_000, 300_100)
+    assert_due_in_range(due_at_ms, 59_000, 60_100)
   end
 
   test "malformed defer outcome fails open to the normal continuation delay" do

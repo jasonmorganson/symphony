@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
-  @deferred_continuation_retry_delay_ms 300_000
+  @deferred_continuation_retry_delay_ms 60_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20

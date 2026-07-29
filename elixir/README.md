@@ -168,7 +168,7 @@ Notes:
 - Symphony advertises a built-in `symphony_report_turn_outcome` tool. Immediate continuation is the
   fail-open default. An agent may report `defer` when another immediate turn would only repeat
   completed work or wait on external evidence; Symphony then performs its next authoritative
-  tracker recheck after five minutes. This is only a scheduling hint: it never changes tracker state
+  tracker recheck after one minute. This is only a scheduling hint: it never changes tracker state
   and it does not accept tracker state names.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
