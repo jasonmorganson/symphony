@@ -130,6 +130,8 @@ defmodule SymphonyElixir.CoreTest do
     assert String.trim(prompt) != ""
     assert prompt =~ "gh pr checks --watch --required"
     assert prompt =~ "do not rerun local gates already covered by the registered required checks"
+    assert prompt =~ "do not restart the full specialty review panel after every repair"
+    assert prompt =~ "at most one consolidated landing review"
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
   end
