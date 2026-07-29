@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
+  @deferred_continuation_retry_delay_ms 300_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -196,6 +197,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info(
+        {:agent_run_outcome, issue_id, %{outcome: :defer} = completion},
+        %{running: running} = state
+      )
+      when is_binary(issue_id) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_entry = Map.put(running_entry, :completion, completion)
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_entry)}}
+    end
+  end
+
+  def handle_info({:agent_run_outcome, _issue_id, _completion}, state), do: {:noreply, state}
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -218,6 +236,32 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
+      schedule_normal_continuation(state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+    if input_required_blocker?(running_entry) do
+      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
+    else
+      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    end
+  end
+
+  defp schedule_normal_continuation(state, issue_id, running_entry, session_id) do
+    if deferred_completion?(running_entry) do
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling deferred authoritative continuation check")
+
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        issue_url: running_entry.issue.url,
+        delay_type: :deferred_continuation,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    else
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
       state
@@ -232,13 +276,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
-    else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+  defp deferred_completion?(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :completion) do
+      %{outcome: :defer} -> true
+      _ -> false
     end
   end
+
+  defp deferred_completion?(_running_entry), do: false
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -1055,6 +1100,7 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            completion: nil,
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -1318,10 +1364,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    case {metadata[:delay_type], attempt} do
+      {:continuation, 1} -> @continuation_retry_delay_ms
+      {:deferred_continuation, 1} -> @deferred_continuation_retry_delay_ms
+      _ -> failure_retry_delay(attempt)
     end
   end
 

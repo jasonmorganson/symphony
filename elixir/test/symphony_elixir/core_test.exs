@@ -1059,6 +1059,91 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "defer outcome arrives before normal worker exit and schedules a bounded authoritative recheck" do
+    issue_id = "issue-defer"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :DeferredContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-DEFER",
+      issue: %Issue{id: issue_id, identifier: "MT-DEFER", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      completion: nil
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(
+      pid,
+      {:agent_run_outcome, issue_id, %{outcome: :defer, reason: "External evidence pending."}}
+    )
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert is_integer(due_at_ms)
+    assert_due_in_range(due_at_ms, 299_000, 300_100)
+  end
+
+  test "malformed defer outcome fails open to the normal continuation delay" do
+    issue_id = "issue-invalid-defer"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :InvalidDeferredContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-INVALID-DEFER",
+      issue: %Issue{id: issue_id, identifier: "MT-INVALID-DEFER", state: "In Progress"},
+      started_at: DateTime.utc_now(),
+      completion: nil
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_outcome, issue_id, %{outcome: :done}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -1900,9 +1985,45 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 0) =~ "symphony_report_turn_outcome"
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "symphony_report_turn_outcome"
+
+      File.write!(trace_file, "")
+
+      deferred_issue = %Issue{
+        id: "issue-defer-runner",
+        identifier: "MT-DEFER-RUNNER",
+        title: "Defer redundant continuation",
+        description: "Wait for external evidence",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-DEFER-RUNNER",
+        labels: [],
+        dispatchable: true
+      }
+
+      deferred_state_fetcher = fn ["issue-defer-runner"] ->
+        {:ok, [%{deferred_issue | updated_at: ~U[2026-07-29 17:00:00Z]}]}
+      end
+
+      assert :ok =
+               AgentRunner.run(deferred_issue, self(),
+                 issue_state_fetcher: deferred_state_fetcher,
+                 turn_outcome_fetcher: fn ->
+                   %{outcome: :defer, reason: "External evidence pending."}
+                 end
+               )
+
+      assert_receive {:agent_run_outcome, "issue-defer-runner",
+                      %{
+                        outcome: :defer,
+                        reason: "External evidence pending."
+                      }}
+
+      deferred_trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/"method":"turn\/start"/, deferred_trace)) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

@@ -4,6 +4,97 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   alias SymphonyElixir.Codex.DynamicTool, as: BoundDynamicTool
   alias SymphonyElixir.Linear.AgentTool, as: DynamicTool
 
+  test "bound tools advertise the built-in scheduling hint without tracker state names" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    assert [
+             %{
+               "description" => description,
+               "inputSchema" => %{
+                 "additionalProperties" => false,
+                 "properties" => %{
+                   "outcome" => %{"enum" => ["continue", "defer"]},
+                   "reason" => %{"maxLength" => 500}
+                 },
+                 "required" => ["outcome"],
+                 "type" => "object"
+               },
+               "name" => "symphony_report_turn_outcome"
+             }
+           ] = BoundDynamicTool.bind().tool_specs
+
+    assert description =~ "scheduling hint"
+    refute description =~ "Human Review"
+    refute description =~ "Done"
+    refute description =~ "Merging"
+  end
+
+  test "built-in scheduling hint validates, replaces, and consumes process-local outcomes" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    binding = BoundDynamicTool.bind()
+
+    :ok = BoundDynamicTool.reset_turn_outcome()
+    assert BoundDynamicTool.take_turn_outcome() == nil
+
+    assert %{"success" => true} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "continue"},
+               binding
+             )
+
+    assert %{"success" => true} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "defer", "reason" => "Waiting for an external check."},
+               binding
+             )
+
+    assert BoundDynamicTool.take_turn_outcome() == %{
+             outcome: :defer,
+             reason: "Waiting for an external check."
+           }
+
+    assert BoundDynamicTool.take_turn_outcome() == nil
+  end
+
+  test "invalid scheduling hints fail open without replacing a valid outcome" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    binding = BoundDynamicTool.bind()
+
+    :ok = BoundDynamicTool.reset_turn_outcome()
+
+    assert %{"success" => true} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "continue", "reason" => "Keep working."},
+               binding
+             )
+
+    assert %{"success" => false} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "Done"},
+               binding
+             )
+
+    assert %{"success" => false} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "defer", "extra" => true},
+               binding
+             )
+
+    assert %{"success" => false} =
+             BoundDynamicTool.execute(
+               "symphony_report_turn_outcome",
+               %{"outcome" => "defer", "reason" => String.duplicate("x", 501)},
+               binding
+             )
+
+    assert BoundDynamicTool.take_turn_outcome() == %{outcome: :continue, reason: "Keep working."}
+  end
+
   test "tool_specs advertises the linear_graphql input contract" do
     assert [
              %{
@@ -53,7 +144,10 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+
+    assert Enum.map(BoundDynamicTool.bind().tool_specs, & &1["name"]) == [
+             "symphony_report_turn_outcome"
+           ]
 
     test_pid = self()
 

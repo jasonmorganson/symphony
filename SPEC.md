@@ -669,9 +669,14 @@ Important nuance:
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
+- The coding agent MAY report a built-in `defer` scheduling hint when another immediate turn would
+  only repeat completed work or wait on external evidence.
+- A scheduling hint MUST NOT change tracker state or encode a requested tracker state. Missing,
+  malformed, or unsupported hints MUST preserve immediate continuation behavior.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+  session. A valid `defer` hint instead schedules a bounded authoritative tracker recheck after
+  about 5 minutes.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -704,6 +709,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
     turn loop.
+  - Use the short continuation delay by default. Use the bounded deferred delay only when the
+    worker reported a valid built-in `defer` scheduling hint before exit.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -1986,6 +1993,10 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     if issue.state is not active or not issue_routable(issue):
       break
 
+    if turn_result.scheduling_hint == defer:
+      send(orchestrator_channel, {agent_run_outcome, issue.id, defer})
+      break
+
     if turn_number >= max_turns:
       break
 
@@ -2008,7 +2019,10 @@ on_worker_exit(issue_id, reason, state):
     state.completed.add(issue_id)  # bookkeeping only
     state = schedule_retry(state, issue_id, 1, {
       identifier: running_entry.identifier,
-      delay_type: continuation
+      delay_type:
+        if running_entry.completion.outcome == defer
+        then deferred_continuation
+        else continuation
     })
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
