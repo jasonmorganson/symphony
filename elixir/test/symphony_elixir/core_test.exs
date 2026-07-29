@@ -132,6 +132,11 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "do not rerun local gates already covered by the registered required checks"
     assert prompt =~ "do not restart the full specialty review panel after every repair"
     assert prompt =~ "at most one consolidated landing review"
+    assert prompt =~ "make an explicit scope-budget decision"
+    assert prompt =~ "bounded exception is part of the authorized scope"
+    assert prompt =~ "Do not silently absorb an open-ended provider migration"
+    assert prompt =~ "If any required exact-head check reaches terminal failure, stop waiting immediately"
+    assert prompt =~ "Do not wait for unrelated or non-required jobs"
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
   end

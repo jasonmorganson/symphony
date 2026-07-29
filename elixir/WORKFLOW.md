@@ -96,6 +96,27 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
 
+## Dependency scope-budget gate
+
+For dependency-maintenance tickets, make an explicit scope-budget decision before
+turning a package update into a provider-tool replacement:
+
+1. Re-read the ticket's acceptance criteria, constraints, and any stated fallback
+   or bounded exception. Record the original update scope and the newly discovered
+   replacement work in the workpad.
+2. Compare the smallest safe options, including keeping or pinning the current
+   package when allowed and replacing the provider tool when required to satisfy
+   the requested upgrade.
+3. Choose the narrowest option that satisfies the ticket. A ticket-authored
+   bounded exception is part of the authorized scope; honor it rather than
+   automatically deferring the replacement merely because it changes tools.
+4. Before replacement work begins, record the decision, its concrete boundary,
+   affected files or components, required validation, and stop conditions in the
+   workpad.
+5. If the replacement exceeds the ticket's stated budget or bounded exception,
+   keep the current ticket within scope and apply the out-of-scope follow-up
+   policy. Do not silently absorb an open-ended provider migration.
+
 ## Related skills
 
 - `linear`: interact with Linear.
@@ -249,6 +270,7 @@ Use this only when completion is blocked by missing required tools or missing au
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
    - Once required checks are registered on the exact current head, wait for them with the land skill's guarded `gh pr checks --watch --required` command in the same turn.
+   - If any required exact-head check reaches terminal failure, stop waiting immediately and inspect that failed job's logs while the overall workflow is still running. Do not wait for unrelated or non-required jobs, or for the whole workflow to conclude, before diagnosing and repairing the failure.
    - While that watch is active, do not rerun local gates already covered by the registered required checks. Run local validation only to diagnose or verify a concrete failure, or after making a new code change.
    - When an exact-head required check exposes a narrow mechanical repair (for example formatting, generated output, a missing CI utility, or an equivalent environment-portability fix), do not restart the full specialty review panel after every repair.
    - Preserve still-valid panel findings and use at most one consolidated landing review for the complete mechanical repair set before republishing. Reopen a specialty review only when the repair materially changes that specialty's behavior or trust boundary.
