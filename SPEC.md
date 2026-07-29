@@ -676,7 +676,7 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session. A valid `defer` hint instead schedules a bounded authoritative tracker recheck after
-  about 1 minute.
+  about 4 minutes.
 
 ### 7.2 Run Attempt Lifecycle
 
