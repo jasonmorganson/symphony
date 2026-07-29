@@ -248,6 +248,8 @@ Use this only when completion is blocked by missing required tools or missing au
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+   - Once required checks are registered on the exact current head, wait for them with the land skill's guarded `gh pr checks --watch --required` command in the same turn.
+   - While that watch is active, do not rerun local gates already covered by the registered required checks. Run local validation only to diagnose or verify a concrete failure, or after making a new code change.
 6. After merge is complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
