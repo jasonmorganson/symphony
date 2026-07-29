@@ -1988,7 +1988,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
-        %{state | codex_rate_limits: rate_limits}
+        %{state | codex_rate_limits: merge_rate_limits(state.codex_rate_limits, rate_limits)}
 
       _ ->
         state
@@ -1996,6 +1996,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_codex_rate_limits(state, _update), do: state
+
+  defp merge_rate_limits(nil, rate_limits), do: rate_limits
+
+  defp merge_rate_limits(previous, rate_limits)
+       when is_map(previous) and is_map(rate_limits) do
+    Map.merge(previous, rate_limits, fn
+      _key, previous_value, nil -> previous_value
+      _key, _previous_value, next_value -> next_value
+    end)
+  end
 
   defp apply_token_delta(codex_totals, token_delta) do
     input_tokens = Map.get(codex_totals, :input_tokens, 0) + token_delta.input_tokens
@@ -2083,13 +2093,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_rate_limits(update) do
-    rate_limits_from_payload(update[:rate_limits]) ||
+    account_rate_limits_from_payload(update[:payload]) ||
+      account_rate_limits_from_payload(Map.get(update, "payload")) ||
+      account_rate_limits_from_payload(update) ||
+      rate_limits_from_payload(update[:rate_limits]) ||
       rate_limits_from_payload(Map.get(update, "rate_limits")) ||
       rate_limits_from_payload(Map.get(update, :rate_limits)) ||
       rate_limits_from_payload(update[:payload]) ||
       rate_limits_from_payload(Map.get(update, "payload")) ||
       rate_limits_from_payload(update)
   end
+
+  defp account_rate_limits_from_payload(payload) when is_map(payload) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+
+    if method in ["account/rateLimits/updated", :"account/rateLimits/updated"] do
+      rate_limits =
+        map_at_path(payload, ["params", "rateLimits"]) ||
+          map_at_path(payload, [:params, :rateLimits])
+
+      if sparse_rate_limits_map?(rate_limits), do: rate_limits
+    end
+  end
+
+  defp account_rate_limits_from_payload(_payload), do: nil
+
+  defp sparse_rate_limits_map?(payload) when is_map(payload) do
+    Enum.any?(
+      [
+        "primary",
+        :primary,
+        "secondary",
+        :secondary,
+        "credits",
+        :credits,
+        "individualLimit",
+        :individualLimit,
+        "rateLimitReachedType",
+        :rateLimitReachedType
+      ],
+      &Map.has_key?(payload, &1)
+    )
+  end
+
+  defp sparse_rate_limits_map?(_payload), do: false
 
   defp absolute_token_usage_from_payload(payload) when is_map(payload) do
     absolute_paths = [

@@ -467,6 +467,64 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     snapshot = GenServer.call(pid, :snapshot)
     assert snapshot.rate_limits == rate_limits
+
+    :sys.replace_state(pid, &%{&1 | codex_rate_limits: nil})
+
+    sparse_rate_limits = %{
+      "limitId" => nil,
+      "limitName" => nil,
+      "primary" => %{
+        "usedPercent" => 82.0,
+        "windowDurationMins" => 300,
+        "resetsAt" => 1_786_000_000
+      },
+      "secondary" => nil,
+      "credits" => nil
+    }
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "account/rateLimits/updated",
+           "params" => %{"rateLimits" => sparse_rate_limits}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.rate_limits == sparse_rate_limits
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "account/rateLimits/updated",
+           "params" => %{
+             "rateLimits" => %{
+               "limitId" => "codex",
+               "primary" => nil,
+               "secondary" => %{
+                 "usedPercent" => 14.0,
+                 "windowDurationMins" => 10,
+                 "resetsAt" => 1_786_000_100
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.rate_limits["limitId"] == "codex"
+    assert snapshot.rate_limits["primary"] == sparse_rate_limits["primary"]
+    assert snapshot.rate_limits["secondary"]["usedPercent"] == 14.0
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do

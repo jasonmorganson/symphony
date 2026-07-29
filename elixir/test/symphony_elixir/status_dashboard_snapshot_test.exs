@@ -194,6 +194,28 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     Snapshot.assert_dashboard_snapshot!("credits_unlimited", render_snapshot(snapshot_data, 42.0))
   end
 
+  test "dashboard renders current app-server rate-limit snapshots" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: %{
+           "limitId" => "codex",
+           "primary" => %{"usedPercent" => 82.0, "windowDurationMins" => 300},
+           "secondary" => nil,
+           "credits" => nil
+         }
+       }}
+
+    rendered = render_snapshot(snapshot_data, 0.0)
+
+    assert rendered =~ "codex"
+    assert rendered =~ "primary 82.00% used"
+    refute rendered =~ "Rate Limits: \e[90munavailable"
+  end
+
   defp render_snapshot(snapshot_data, tps) do
     StatusDashboard.format_snapshot_content_for_test(snapshot_data, tps, @terminal_columns)
   end
