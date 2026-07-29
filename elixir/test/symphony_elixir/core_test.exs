@@ -1059,7 +1059,7 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
-  test "defer outcome arrives before normal worker exit and schedules a bounded authoritative recheck" do
+  test "defer outcome schedules an authoritative recheck within four minutes and below the five-minute SLO" do
     issue_id = "issue-defer"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :DeferredContinuationOrchestrator)
@@ -1102,7 +1102,8 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 59_000, 60_100)
+    assert_due_in_range(due_at_ms, 239_000, 240_100)
+    assert due_at_ms - System.monotonic_time(:millisecond) < 300_000
   end
 
   test "malformed defer outcome fails open to the normal continuation delay" do
