@@ -2281,6 +2281,10 @@ Extension config:
   - Shared per-host cap applied across configured SSH hosts.
 - `worker.drain_state_path` (path string, OPTIONAL)
   - Durable exact set of SSH hosts excluded from new dispatches.
+- `worker.affinity_state_path` (path string, OPTIONAL)
+  - Durable issue-to-host assignments for remote workspaces.
+- `worker.affinity_seed_path` (path string, OPTIONAL)
+  - Prevalidated one-time initial assignments, used only when durable affinity state is absent.
 
 ### A.1 Execution Model
 
@@ -2292,7 +2296,8 @@ Extension config:
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
 - The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
   orchestrator still owns the session lifecycle even though commands execute remotely.
-- Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
+- Continuation turns and retries MUST stay on the durable assigned host when
+  `worker.affinity_state_path` is configured.
 - A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
   shell, writable workspace root, coding-agent executable, and any required auth or repository
   prerequisites.
@@ -2300,8 +2305,8 @@ Extension config:
 ### A.2 Scheduling Notes
 
 - SSH hosts MAY be treated as a pool for dispatch.
-- Implementations MAY prefer the previously used host on retries when that host is still
-  available.
+- Implementations with durable affinity MUST select the recorded host on startup, continuation,
+  retry, and stalled-session recovery.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
 - Drained hosts MUST remain ineligible for new dispatches, while active sessions already assigned
@@ -2310,8 +2315,8 @@ Extension config:
   atomically, validate hosts against `worker.ssh_hosts`, and authenticate mutation requests.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
-- Implementations MAY fail over to another host when the original host is unavailable before work
-  has meaningfully started.
+- An implementation with durable affinity MUST wait when the recorded host is unavailable; it
+  MUST NOT silently select another host whose workspace may be stale.
 - Once a run has already produced side effects, a transparent rerun on another host SHOULD be
   treated as a new attempt, not as invisible failover.
 

@@ -318,6 +318,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  }
                ]
              },
+             "worker_affinities" => [],
              "worker_pool" => %{
                "configured" => 2,
                "drained" => 1,

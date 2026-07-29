@@ -7,7 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    StatusDashboard,
+    Tracker,
+    WorkerAffinityStore,
+    Workspace
+  }
+
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -43,6 +51,8 @@ defmodule SymphonyElixir.Orchestrator do
       configured_worker_hosts: [],
       drained_worker_hosts: MapSet.new(),
       drain_state_path: nil,
+      worker_affinities: %{},
+      affinity_state_path: nil,
       demand_eligible: 0,
       demand_observed_at: nil,
       observed_issues: [],
@@ -66,29 +76,61 @@ defmodule SymphonyElixir.Orchestrator do
         now_ms = System.monotonic_time(:millisecond)
         drain_state_path = Keyword.get(opts, :drain_state_path, config.worker.drain_state_path)
 
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
-          configured_worker_hosts: config.worker.ssh_hosts,
-          drained_worker_hosts: load_drained_worker_hosts(drain_state_path, config.worker.ssh_hosts),
-          drain_state_path: drain_state_path,
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+        affinity_state_path =
+          Keyword.get(opts, :affinity_state_path, config.worker.affinity_state_path)
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+        case WorkerAffinityStore.load(
+               affinity_state_path,
+               config.worker.affinity_seed_path,
+               config.worker.ssh_hosts
+             ) do
+          {:ok, worker_affinities} ->
+            state =
+              initial_state(
+                config,
+                opts,
+                now_ms,
+                drain_state_path,
+                affinity_state_path,
+                worker_affinities
+              )
 
-        {:ok, state}
+            run_terminal_workspace_cleanup()
+            {:ok, schedule_tick(state, 0)}
+
+          {:error, reason} ->
+            {:stop, reason}
+        end
 
       {:error, reason} ->
         {:stop, reason}
     end
+  end
+
+  defp initial_state(
+         config,
+         opts,
+         now_ms,
+         drain_state_path,
+         affinity_state_path,
+         worker_affinities
+       ) do
+    %State{
+      poll_interval_ms: config.polling.interval_ms,
+      max_concurrent_agents: config.agent.max_concurrent_agents,
+      next_poll_due_at_ms: now_ms,
+      poll_check_in_progress: false,
+      tick_timer_ref: nil,
+      tick_token: nil,
+      task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+      configured_worker_hosts: config.worker.ssh_hosts,
+      drained_worker_hosts: load_drained_worker_hosts(drain_state_path, config.worker.ssh_hosts),
+      drain_state_path: drain_state_path,
+      worker_affinities: worker_affinities,
+      affinity_state_path: affinity_state_path,
+      codex_totals: @empty_codex_totals,
+      codex_rate_limits: nil
+    }
   end
 
   @impl true
@@ -312,6 +354,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state =
       state
+      |> reconcile_worker_affinities()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
@@ -396,6 +439,41 @@ defmodule SymphonyElixir.Orchestrator do
 
           state
       end
+    end
+  end
+
+  defp reconcile_worker_affinities(%State{worker_affinities: affinities} = state)
+       when map_size(affinities) == 0,
+       do: state
+
+  defp reconcile_worker_affinities(%State{} = state) do
+    issue_ids = Map.keys(state.worker_affinities)
+
+    case Tracker.fetch_issues_by_ids(issue_ids) do
+      {:ok, issues} ->
+        terminal_states = terminal_state_set()
+
+        Enum.reduce(issues, state, fn
+          %Issue{} = issue, state_acc ->
+            reconcile_worker_affinity(issue, state_acc, terminal_states)
+
+          _, state_acc ->
+            state_acc
+        end)
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh worker affinities: #{inspect(reason)}; retaining existing affinities")
+
+        state
+    end
+  end
+
+  defp reconcile_worker_affinity(%Issue{} = issue, state, terminal_states) do
+    if terminal_issue_state?(issue.state, terminal_states) do
+      cleanup_issue_workspace(issue, affinity_host(state, issue.id))
+      release_issue_affinity_and_claim(state, issue.id)
+    else
+      state
     end
   end
 
@@ -516,7 +594,9 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state
+        |> terminate_running_issue(issue.id, true)
+        |> release_issue_affinity_and_claim(issue.id)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -551,7 +631,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
-        release_issue_claim(state, issue.id)
+        release_issue_affinity_and_claim(state, issue.id)
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
@@ -723,7 +803,9 @@ defmodule SymphonyElixir.Orchestrator do
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
+          error: "stalled for #{elapsed_ms}ms without codex activity",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
         })
       end
     else
@@ -1071,6 +1153,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+    preferred_worker_host = affinity_host(state, issue.id) || preferred_worker_host
+
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
@@ -1112,7 +1196,20 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case persist_issue_affinity(state, issue.id, worker_host) do
+          {:ok, state} ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+
+          {:error, reason} ->
+            Logger.error("Unable to persist worker affinity for #{issue_context(issue)} worker_host=#{worker_host}: #{inspect(reason)}")
+
+            schedule_issue_retry(state, issue.id, attempt, %{
+              identifier: issue.identifier,
+              issue_url: issue.url,
+              error: "failed to persist worker affinity: #{inspect(reason)}",
+              worker_host: worker_host
+            })
+        end
     end
   end
 
@@ -1285,7 +1382,7 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
-        {:noreply, release_issue_claim(state, issue_id)}
+        {:noreply, release_issue_affinity_and_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1456,36 +1553,32 @@ defmodule SymphonyElixir.Orchestrator do
         hosts -> hosts
       end
 
-    case configured_hosts do
-      [] ->
-        nil
-
-      hosts ->
-        available_hosts =
-          Enum.filter(hosts, fn host ->
-            !MapSet.member?(state.drained_worker_hosts, host) and
-              worker_host_slots_available?(state, host)
-          end)
-
-        cond do
-          available_hosts == [] ->
-            :no_worker_capacity
-
-          preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
-            preferred_worker_host
-
-          true ->
-            least_loaded_worker_host(state, available_hosts)
-        end
-    end
+    select_configured_worker_host(state, configured_hosts, preferred_worker_host)
   end
 
-  defp preferred_worker_host_available?(preferred_worker_host, hosts)
-       when is_binary(preferred_worker_host) and is_list(hosts) do
-    preferred_worker_host != "" and preferred_worker_host in hosts
+  defp select_configured_worker_host(_state, [], _preferred_worker_host), do: nil
+
+  defp select_configured_worker_host(state, hosts, preferred_worker_host) do
+    available_hosts =
+      Enum.filter(hosts, fn host ->
+        !MapSet.member?(state.drained_worker_hosts, host) and
+          worker_host_slots_available?(state, host)
+      end)
+
+    choose_available_worker_host(state, available_hosts, preferred_worker_host)
   end
 
-  defp preferred_worker_host_available?(_preferred_worker_host, _hosts), do: false
+  defp choose_available_worker_host(_state, [], _preferred_worker_host),
+    do: :no_worker_capacity
+
+  defp choose_available_worker_host(_state, hosts, preferred_worker_host)
+       when is_binary(preferred_worker_host) and preferred_worker_host != "" do
+    if preferred_worker_host in hosts, do: preferred_worker_host, else: :no_worker_capacity
+  end
+
+  defp choose_available_worker_host(state, hosts, _preferred_worker_host) do
+    least_loaded_worker_host(state, hosts)
+  end
 
   defp least_loaded_worker_host(%State{} = state, hosts) when is_list(hosts) do
     hosts
@@ -1681,6 +1774,17 @@ defmodule SymphonyElixir.Orchestrator do
 
     available_hosts = available_worker_hosts(state)
 
+    affinity_entries =
+      state.worker_affinities
+      |> Enum.map(fn {issue_id, worker_host} -> %{issue_id: issue_id, worker_host: worker_host} end)
+      |> Enum.sort_by(& &1.issue_id)
+
+    required_hosts =
+      state.worker_affinities
+      |> Map.values()
+      |> Enum.uniq()
+      |> Enum.sort()
+
     {:reply,
      %{
        running: running,
@@ -1701,8 +1805,10 @@ defmodule SymphonyElixir.Orchestrator do
          configured_hosts: state.configured_worker_hosts,
          drained_hosts: state.drained_worker_hosts |> MapSet.to_list() |> Enum.sort(),
          available_hosts: available_hosts,
-         available_slots: available_worker_slot_count(state)
+         available_slots: available_worker_slot_count(state),
+         required_hosts: required_hosts
        },
+       worker_affinities: affinity_entries,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -2005,6 +2111,55 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         _ = File.rm(temporary)
         {:error, {:drain_state_write_failed, reason}}
+    end
+  end
+
+  defp affinity_host(%State{} = state, issue_id) when is_binary(issue_id) do
+    Map.get(state.worker_affinities, issue_id)
+  end
+
+  defp affinity_host(_state, _issue_id), do: nil
+
+  defp persist_issue_affinity(%State{} = state, _issue_id, nil), do: {:ok, state}
+
+  defp persist_issue_affinity(%State{} = state, issue_id, worker_host) do
+    case Map.fetch(state.worker_affinities, issue_id) do
+      {:ok, ^worker_host} ->
+        {:ok, state}
+
+      {:ok, other_host} ->
+        {:error, {:worker_affinity_conflict, other_host}}
+
+      :error ->
+        case WorkerAffinityStore.put(
+               state.affinity_state_path,
+               state.worker_affinities,
+               issue_id,
+               worker_host,
+               state.configured_worker_hosts
+             ) do
+          {:ok, affinities} -> {:ok, %{state | worker_affinities: affinities}}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp release_issue_affinity_and_claim(%State{} = state, issue_id) do
+    case WorkerAffinityStore.delete(
+           state.affinity_state_path,
+           state.worker_affinities,
+           issue_id,
+           state.configured_worker_hosts
+         ) do
+      {:ok, affinities} ->
+        state
+        |> Map.put(:worker_affinities, affinities)
+        |> release_issue_claim(issue_id)
+
+      {:error, reason} ->
+        Logger.error("Unable to release worker affinity for terminal issue_id=#{issue_id}: #{inspect(reason)}")
+
+        state
     end
   end
 

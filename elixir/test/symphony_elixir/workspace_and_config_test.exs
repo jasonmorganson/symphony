@@ -794,6 +794,67 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "orchestrator restores durable worker affinities and exposes required hosts" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worker-affinity-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    affinity_path = Path.join(test_root, "worker-affinities.json")
+    hosts = ["symphony-worker-0", "symphony-worker-1"]
+    File.mkdir_p!(test_root)
+
+    File.write!(
+      affinity_path,
+      Jason.encode!(%{version: 1, affinities: %{"issue-1" => "symphony-worker-1"}})
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :DurableWorkerAffinityOrchestrator)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      worker_ssh_hosts: hosts,
+      worker_affinity_state_path: affinity_path
+    )
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    snapshot = Orchestrator.snapshot(orchestrator_name, 5_000)
+
+    assert snapshot.worker_affinities == [
+             %{issue_id: "issue-1", worker_host: "symphony-worker-1"}
+           ]
+
+    assert snapshot.worker_pool.required_hosts == ["symphony-worker-1"]
+    GenServer.stop(pid)
+  end
+
+  test "orchestrator refuses corrupt durable worker affinity state" do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worker-affinity-corrupt-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+    affinity_path = Path.join(test_root, "worker-affinities.json")
+    File.mkdir_p!(test_root)
+    File.write!(affinity_path, "not-json")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      worker_ssh_hosts: ["symphony-worker-0"],
+      worker_affinity_state_path: affinity_path
+    )
+
+    assert {:error, {:invalid_affinity_state, %Jason.DecodeError{}}} =
+             Orchestrator.start_link(name: Module.concat(__MODULE__, :CorruptAffinityOrchestrator))
+  end
+
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
     parent = self()
     original_workflow_path = Workflow.workflow_file_path()

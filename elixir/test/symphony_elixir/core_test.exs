@@ -1340,6 +1340,20 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "select_worker_host_for_test never falls back when a preferred durable host is unavailable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      drained_worker_hosts: MapSet.new(["worker-a"]),
+      running: %{}
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == :no_worker_capacity
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
