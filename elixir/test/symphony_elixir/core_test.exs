@@ -128,6 +128,8 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
+    assert prompt =~ "gh pr checks --watch --required"
+    assert prompt =~ "do not rerun local gates already covered by the registered required checks"
     assert is_binary(Config.workflow_prompt())
     assert Config.workflow_prompt() == prompt
   end
