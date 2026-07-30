@@ -230,10 +230,12 @@ codex:
 This fork keeps upstream orchestration and adds a small authenticated surface for an external
 Kubernetes controller:
 
-- `GET /api/v1/state` includes cached `demand.eligible`, `demand.observed_at`, worker affinity
-  entries, and `worker_pool` counts. `worker_pool.required_hosts` lets an external autoscaler keep
-  every durable workspace owner available. Demand is calculated from the candidate list already
-  fetched by the normal poll.
+- `GET /api/v1/state` includes cached `demand.eligible`, `demand.dependency_blocked`,
+  `demand.observed_at`, worker affinity entries, and `worker_pool` counts.
+  `dependency_blocked` identifies active Todo issues waiting on nonterminal tracker blockers
+  without making them dispatchable. `worker_pool.required_hosts` lets an external autoscaler keep
+  every durable workspace owner available. Demand and blocker visibility are calculated from the
+  candidate list already fetched by the normal poll.
 - `PUT /api/v1/worker-drains` replaces the exact durable drain set. It requires
   `Authorization: Bearer <SYMPHONY_WORKER_DRAIN_TOKEN>` with a token of at least 32 bytes and
   returns configured, drained, and still-active drained hosts.

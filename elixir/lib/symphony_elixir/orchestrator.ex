@@ -57,7 +57,9 @@ defmodule SymphonyElixir.Orchestrator do
       worker_affinities: %{},
       affinity_state_path: nil,
       demand_eligible: 0,
+      demand_dependency_blocked: 0,
       demand_observed_at: nil,
+      dependency_blocked_issues: [],
       observed_issues: [],
       observed_issues_observed_at: nil,
       codex_totals: nil,
@@ -412,6 +414,7 @@ defmodule SymphonyElixir.Orchestrator do
       state =
         state
         |> observe_demand(dispatch_issues)
+        |> observe_dependency_blocked_issues(active_issues)
         |> observe_issues(observed_issues)
 
       if available_slots(state) > 0 do
@@ -621,7 +624,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec demand_from_issues_for_test([Issue.t()], term()) :: map()
   def demand_from_issues_for_test(issues, %State{} = state) when is_list(issues) do
     state = observe_demand(state, issues)
-    %{eligible: state.demand_eligible, observed_at: state.demand_observed_at}
+
+    %{
+      eligible: state.demand_eligible,
+      dependency_blocked: state.demand_dependency_blocked,
+      observed_at: state.demand_observed_at
+    }
   end
 
   @doc false
@@ -1202,8 +1210,33 @@ defmodule SymphonyElixir.Orchestrator do
           false
       end)
 
-    %{state | demand_eligible: eligible, demand_observed_at: DateTime.utc_now()}
+    %{
+      state
+      | demand_eligible: eligible,
+        demand_dependency_blocked: Enum.count(issues, &dependency_blocked_issue?/1),
+        demand_observed_at: DateTime.utc_now()
+    }
   end
+
+  defp observe_dependency_blocked_issues(%State{} = state, issues) when is_list(issues) do
+    blocked_issues =
+      issues
+      |> Enum.filter(&dependency_blocked_issue?/1)
+      |> Enum.sort_by(&{&1.priority || 5, &1.created_at, &1.identifier})
+
+    %{state | dependency_blocked_issues: blocked_issues}
+  end
+
+  defp dependency_blocked_issue?(%Issue{
+         state: state,
+         dispatchable: false,
+         blocked_by: [_ | _]
+       })
+       when is_binary(state) do
+    normalize_issue_state(state) == "todo"
+  end
+
+  defp dependency_blocked_issue?(_issue), do: false
 
   defp issue_routable?(%Issue{} = issue) do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
@@ -1925,8 +1958,10 @@ defmodule SymphonyElixir.Orchestrator do
        blocked: blocked,
        demand: %{
          eligible: state.demand_eligible,
+         dependency_blocked: state.demand_dependency_blocked,
          observed_at: state.demand_observed_at
        },
+       dependency_blocked: state.dependency_blocked_issues,
        observed: %{
          issues: state.observed_issues,
          observed_at: state.observed_issues_observed_at

@@ -769,6 +769,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         title: "Blocked",
         state: "Todo",
         dispatchable: true
+      },
+      %Issue{
+        id: "dependency-blocked",
+        identifier: "MT-DEPENDENCY-BLOCKED",
+        title: "Dependency blocked",
+        state: "Todo",
+        dispatchable: false,
+        blocked_by: [
+          %{id: "blocker", identifier: "MT-BLOCKER", state: "Human Review"}
+        ]
       }
     ]
 
@@ -777,7 +787,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       blocked: %{"blocked" => %{}}
     }
 
-    assert %{eligible: 2, observed_at: %DateTime{}} =
+    assert %{eligible: 2, dependency_blocked: 1, observed_at: %DateTime{}} =
              Orchestrator.demand_from_issues_for_test(issues, state)
   end
 
