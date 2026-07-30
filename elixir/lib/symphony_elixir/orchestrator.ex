@@ -297,7 +297,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_normal_continuation(state, issue_id, running_entry, session_id) do
     if deferred_completion?(running_entry) do
-      {state, defer_count} = record_defer_streak(state, issue_id, running_entry.issue)
+      {state, defer_count} = record_defer_streak(state, issue_id, running_entry)
 
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling deferred authoritative continuation check")
 
@@ -337,16 +337,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp deferred_completion?(_running_entry), do: false
 
-  defp record_defer_streak(%State{} = state, issue_id, %Issue{} = issue) do
-    fingerprint = {issue.state, issue.updated_at}
+  defp record_defer_streak(%State{} = state, issue_id, %{issue: %Issue{} = issue} = running_entry) do
+    completion = Map.get(running_entry, :completion, %{})
+    issue_state = Map.get(completion, :issue_state, issue.state)
+    observed_before_updated_at = Map.get(completion, :observed_before_updated_at, issue.updated_at)
+    observed_after_updated_at = Map.get(completion, :observed_after_updated_at, issue.updated_at)
 
     defer_count =
       case Map.get(state.defer_streaks, issue_id) do
-        %{fingerprint: ^fingerprint, count: count} when is_integer(count) and count > 0 -> count + 1
-        _ -> 1
+        %{
+          issue_state: ^issue_state,
+          observed_after_updated_at: ^observed_before_updated_at,
+          count: count
+        }
+        when is_integer(count) and count > 0 ->
+          count + 1
+
+        _ ->
+          1
       end
 
-    {%{state | defer_streaks: Map.put(state.defer_streaks, issue_id, %{fingerprint: fingerprint, count: defer_count})}, defer_count}
+    streak = %{
+      issue_state: issue_state,
+      observed_after_updated_at: observed_after_updated_at,
+      count: defer_count
+    }
+
+    {%{state | defer_streaks: Map.put(state.defer_streaks, issue_id, streak)}, defer_count}
   end
 
   defp clear_defer_streak(%State{} = state, issue_id) do
