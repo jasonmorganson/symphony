@@ -612,6 +612,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec active_drained_worker_hosts_for_test(term()) :: [String.t()]
+  def active_drained_worker_hosts_for_test(%State{} = state) do
+    active_drained_worker_hosts(state)
+  end
+
+  @doc false
   @spec demand_from_issues_for_test([Issue.t()], term()) :: map()
   def demand_from_issues_for_test(issues, %State{} = state) when is_list(issues) do
     state = observe_demand(state, issues)
@@ -2235,12 +2241,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp active_drained_worker_hosts(%State{} = state) do
-    running_hosts = Enum.map(state.running, fn {_issue_id, entry} -> Map.get(entry, :worker_host) end)
-
-    retry_hosts =
-      Enum.map(state.retry_attempts, fn {_issue_id, entry} -> Map.get(entry, :worker_host) end)
-
-    (running_hosts ++ retry_hosts)
+    state.running
+    |> Enum.map(fn {_issue_id, entry} -> Map.get(entry, :worker_host) end)
     |> Enum.filter(&MapSet.member?(state.drained_worker_hosts, &1))
     |> Enum.uniq()
     |> Enum.sort()

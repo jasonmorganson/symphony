@@ -1613,6 +1613,23 @@ defmodule SymphonyElixir.CoreTest do
     refute_receive :stale_capacity_retry
   end
 
+  test "active drained hosts include running sessions but not deferred retries" do
+    state = %Orchestrator.State{
+      drained_worker_hosts: MapSet.new(["worker-a", "worker-b"]),
+      running: %{
+        "running-issue" => %{worker_host: "worker-a"}
+      },
+      retry_attempts: %{
+        "deferred-issue" => %{
+          worker_host: "worker-b",
+          due_at_ms: System.monotonic_time(:millisecond) + 60_000
+        }
+      }
+    }
+
+    assert Orchestrator.active_drained_worker_hosts_for_test(state) == ["worker-a"]
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 

@@ -2318,6 +2318,9 @@ Extension config:
   to a newly drained host continue under the normal session lifecycle.
 - An implementation exposing remote drain control SHOULD replace the complete durable drain set
   atomically, validate hosts against `worker.ssh_hosts`, and authenticate mutation requests.
+- Drain acknowledgements that report active drained hosts MUST include running sessions, not
+  deferred retry timers. A deferred retry retains its durable host affinity and waits for that host
+  to become available before dispatch.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
 - An implementation with durable affinity MUST wait when the recorded host is unavailable; it
