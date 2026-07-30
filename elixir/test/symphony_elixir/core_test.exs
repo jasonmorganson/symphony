@@ -7,6 +7,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_api_token: nil,
       tracker_project_slug: nil,
       poll_interval_ms: nil,
+      request_interval_ms: nil,
       tracker_active_states: nil,
       tracker_terminal_states: nil,
       codex_command: nil
@@ -14,6 +15,7 @@ defmodule SymphonyElixir.CoreTest do
 
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
+    assert config.polling.request_interval_ms == 1_500
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
@@ -23,6 +25,10 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "polling.interval_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), request_interval_ms: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "polling.request_interval_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: 45_000)
     assert Config.settings!().polling.interval_ms == 45_000
@@ -1068,7 +1074,7 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
-  test "defer outcome schedules an authoritative recheck within four minutes and below the five-minute SLO" do
+  test "deferred Merging reconciliation remains claimed and wakes below the five-minute SLO" do
     issue_id = "issue-defer"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :DeferredContinuationOrchestrator)
@@ -1086,7 +1092,7 @@ defmodule SymphonyElixir.CoreTest do
       pid: self(),
       ref: ref,
       identifier: "MT-DEFER",
-      issue: %Issue{id: issue_id, identifier: "MT-DEFER", state: "In Progress"},
+      issue: %Issue{id: issue_id, identifier: "MT-DEFER", state: "Merging"},
       started_at: DateTime.utc_now(),
       completion: nil
     }

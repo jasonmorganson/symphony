@@ -149,6 +149,9 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `polling.request_interval_ms` spaces the starts of all Linear GraphQL
+  requests across poll, retry, and tool paths. It defaults to `1500`; set it to
+  `0` only when another shared limiter provides equivalent pacing.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -227,8 +230,10 @@ Kubernetes controller:
   returns configured, drained, and still-active drained hosts.
 - Drained hosts are excluded from normal worker selection. No state, including `Merging`, receives
   a fork-specific concurrency limit.
-- Linear HTTP 429 responses and GraphQL `RATELIMITED` errors activate one shared cooldown, so
-  concurrent poll, retry, and tool paths do not amplify provider throttling.
+- Linear requests are proactively spaced by `polling.request_interval_ms`.
+  HTTP 429 responses and GraphQL `RATELIMITED` errors also activate one shared
+  cooldown, so concurrent poll, retry, and tool paths do not amplify provider
+  throttling.
 
 ### Linear adapter profile
 
