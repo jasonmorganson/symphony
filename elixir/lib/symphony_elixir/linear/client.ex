@@ -144,13 +144,18 @@ defmodule SymphonyElixir.Linear.Client do
     tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
     rate_limit_server = Keyword.get(opts, :rate_limit_server, RateLimit)
 
+    request_interval_ms =
+      Keyword.get_lazy(opts, :request_interval_ms, fn ->
+        configured_request_interval_ms()
+      end)
+
     request_fun =
       Keyword.get(opts, :request_fun, fn request_payload, headers ->
         post_graphql_request(request_payload, headers, tracker_settings.endpoint)
       end)
 
     with {:ok, headers} <- graphql_headers(tracker_settings),
-         :ok <- RateLimit.check(rate_limit_server) do
+         :ok <- RateLimit.acquire(request_interval_ms, rate_limit_server) do
       case request_fun.(payload, headers) do
         {:ok, %{status: 200, body: body}} ->
           {:ok, body}
@@ -165,6 +170,12 @@ defmodule SymphonyElixir.Linear.Client do
     else
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp configured_request_interval_ms do
+    Config.settings!().polling.request_interval_ms
+  rescue
+    ArgumentError -> 1_500
   end
 
   @doc false
