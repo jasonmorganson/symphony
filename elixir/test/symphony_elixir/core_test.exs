@@ -1220,6 +1220,64 @@ defmodule SymphonyElixir.CoreTest do
     assert due_at_ms - System.monotonic_time(:millisecond) < 300_000
   end
 
+  test "unchanged non-Merging deferrals back off and tracker changes reset the delay" do
+    issue_id = "issue-human-review-defer"
+    orchestrator_name = Module.concat(__MODULE__, :HumanReviewDeferredContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    original_updated_at = ~U[2026-07-30 09:00:00Z]
+
+    defer_issue = fn ref, updated_at ->
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: "MT-HUMAN-REVIEW-DEFER",
+        issue: %Issue{
+          id: issue_id,
+          identifier: "MT-HUMAN-REVIEW-DEFER",
+          state: "Human Review",
+          updated_at: updated_at
+        },
+        started_at: DateTime.utc_now(),
+        completion: nil
+      }
+
+      :sys.replace_state(pid, fn state ->
+        state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(
+        pid,
+        {:agent_run_outcome, issue_id, %{outcome: :defer, reason: "External evidence pending."}}
+      )
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      :sys.get_state(pid)
+    end
+
+    first_state = defer_issue.(make_ref(), original_updated_at)
+    assert %{due_at_ms: first_due_at_ms} = first_state.retry_attempts[issue_id]
+    assert_due_in_range(first_due_at_ms, 239_000, 240_100)
+
+    second_state = defer_issue.(make_ref(), original_updated_at)
+    assert %{due_at_ms: second_due_at_ms} = second_state.retry_attempts[issue_id]
+    assert_due_in_range(second_due_at_ms, 479_000, 480_100)
+
+    changed_state = defer_issue.(make_ref(), DateTime.add(original_updated_at, 60, :second))
+    assert %{due_at_ms: changed_due_at_ms} = changed_state.retry_attempts[issue_id]
+    assert_due_in_range(changed_due_at_ms, 239_000, 240_100)
+  end
+
   test "malformed defer outcome fails open to the normal continuation delay" do
     issue_id = "issue-invalid-defer"
     ref = make_ref()

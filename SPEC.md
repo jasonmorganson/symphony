@@ -676,7 +676,9 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session. A valid `defer` hint instead schedules a bounded authoritative tracker recheck after
-  about 4 minutes.
+  about 4 minutes. Consecutive deferrals whose tracker state and `updated_at` are unchanged MUST
+  back off exponentially to a one-hour cap, except that `Merging` MUST retain the four-minute
+  reconciliation cadence. A tracker state or `updated_at` change MUST reset the defer streak.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -710,7 +712,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
     turn loop.
   - Use the short continuation delay by default. Use the bounded deferred delay only when the
-    worker reported a valid built-in `defer` scheduling hint before exit.
+    worker reported a valid built-in `defer` scheduling hint before exit. Progressively back off
+    unchanged non-`Merging` deferrals, while keeping `Merging` on the bounded initial delay.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
