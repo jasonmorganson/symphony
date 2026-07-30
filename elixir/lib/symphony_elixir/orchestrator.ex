@@ -606,6 +606,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec select_worker_host_for_test(term(), String.t() | nil, String.t() | nil) ::
+          String.t() | nil | :no_worker_capacity
+  def select_worker_host_for_test(%State{} = state, preferred_worker_host, issue_id) do
+    select_worker_host(state, preferred_worker_host, issue_id)
+  end
+
+  @doc false
   @spec wake_capacity_blocked_retries_for_test(term(), MapSet.t(), MapSet.t()) :: term()
   def wake_capacity_blocked_retries_for_test(
         %State{} = state,
@@ -1338,7 +1345,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
+    case select_worker_host(state, preferred_worker_host, issue.id) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
@@ -1597,7 +1604,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
+         worker_slots_available?(state, metadata[:worker_host], issue.id) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
@@ -1713,19 +1720,19 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
-  defp select_worker_host(%State{} = state, preferred_worker_host) do
+  defp select_worker_host(%State{} = state, preferred_worker_host, issue_id \\ nil) do
     configured_hosts =
       case state.configured_worker_hosts do
         [] -> Config.settings!().worker.ssh_hosts
         hosts -> hosts
       end
 
-    select_configured_worker_host(state, configured_hosts, preferred_worker_host)
+    select_configured_worker_host(state, configured_hosts, preferred_worker_host, issue_id)
   end
 
-  defp select_configured_worker_host(_state, [], _preferred_worker_host), do: nil
+  defp select_configured_worker_host(_state, [], _preferred_worker_host, _issue_id), do: nil
 
-  defp select_configured_worker_host(state, hosts, preferred_worker_host) do
+  defp select_configured_worker_host(state, hosts, preferred_worker_host, issue_id) do
     available_hosts =
       Enum.filter(hosts, fn host ->
         !MapSet.member?(state.drained_worker_hosts, host) and
@@ -1733,11 +1740,9 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     selectable_hosts =
-      if is_binary(preferred_worker_host) and preferred_worker_host != "" do
-        available_hosts
-      else
-        Enum.reject(available_hosts, &worker_host_reserved_for_retry?(state, &1))
-      end
+      Enum.reject(available_hosts, fn host ->
+        worker_host_reserved_for_other_retry?(state, host, issue_id)
+      end)
 
     choose_available_worker_host(state, selectable_hosts, preferred_worker_host)
   end
@@ -1774,8 +1779,8 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, nil) != :no_worker_capacity
   end
 
-  defp worker_slots_available?(%State{} = state, preferred_worker_host) do
-    select_worker_host(state, preferred_worker_host) != :no_worker_capacity
+  defp worker_slots_available?(%State{} = state, preferred_worker_host, issue_id) do
+    select_worker_host(state, preferred_worker_host, issue_id) != :no_worker_capacity
   end
 
   defp worker_host_slots_available?(%State{} = state, worker_host) when is_binary(worker_host) do
@@ -1790,12 +1795,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp worker_host_reserved_for_retry?(%State{} = state, worker_host)
        when is_binary(worker_host) do
+    worker_host_reserved_for_other_retry?(state, worker_host, nil)
+  end
+
+  defp worker_host_reserved_for_other_retry?(%State{} = state, worker_host, issue_id)
+       when is_binary(worker_host) do
     reservation_deadline_ms =
       System.monotonic_time(:millisecond) + @retry_worker_reservation_window_ms
 
     Enum.any?(state.retry_attempts, fn
-      {_issue_id, %{worker_host: ^worker_host, due_at_ms: due_at_ms}}
-      when is_integer(due_at_ms) ->
+      {retry_issue_id, %{worker_host: ^worker_host, due_at_ms: due_at_ms}}
+      when retry_issue_id != issue_id and is_integer(due_at_ms) ->
         due_at_ms <= reservation_deadline_ms
 
       _ ->
