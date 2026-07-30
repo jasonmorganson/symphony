@@ -300,11 +300,34 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "observed" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "blocked" => 1,
+               "dependency_blocked" => 1,
+               "observed" => 1
+             },
              "demand" => %{
                "eligible" => 4,
+               "dependency_blocked" => 1,
                "observed_at" => "2026-07-28T10:00:00Z"
              },
+             "dependency_blocked" => [
+               %{
+                 "issue_id" => "issue-waiting",
+                 "identifier" => "MT-WAITING",
+                 "state" => "Todo",
+                 "url" => "https://example.org/issues/MT-WAITING",
+                 "priority" => 2,
+                 "blockers" => [
+                   %{
+                     "id" => "issue-parent",
+                     "identifier" => "MT-PARENT",
+                     "state" => "Human Review"
+                   }
+                 ]
+               }
+             ],
              "observed" => %{
                "observed_at" => "2026-07-28T10:00:00Z",
                "issues" => [
@@ -747,6 +770,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "running" => 1,
              "retrying" => 1,
              "blocked" => 1,
+             "dependency_blocked" => 1,
              "observed" => 1
            }
 
@@ -840,7 +864,24 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
-      demand: %{eligible: 4, observed_at: ~U[2026-07-28 10:00:00Z]},
+      demand: %{
+        eligible: 4,
+        dependency_blocked: 1,
+        observed_at: ~U[2026-07-28 10:00:00Z]
+      },
+      dependency_blocked: [
+        %SymphonyElixir.Tracker.Issue{
+          id: "issue-waiting",
+          identifier: "MT-WAITING",
+          state: "Todo",
+          url: "https://example.org/issues/MT-WAITING",
+          priority: 2,
+          dispatchable: false,
+          blocked_by: [
+            %{id: "issue-parent", identifier: "MT-PARENT", state: "Human Review"}
+          ]
+        }
+      ],
       observed: %{
         observed_at: ~U[2026-07-28 10:00:00Z],
         issues: [
