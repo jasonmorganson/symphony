@@ -1804,6 +1804,89 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner treats a clean incomplete app-server exit as an immediate continuation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-clean-incomplete-exit-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.mkdir_p!(workspace_root)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+
+      System.cmd("git", [
+        "-c",
+        "commit.gpgsign=false",
+        "-C",
+        template_repo,
+        "commit",
+        "-m",
+        "initial"
+      ])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-clean-exit"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-clean-exit"}}}'
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-clean-incomplete-exit",
+        identifier: "S-CLEAN-EXIT",
+        title: "Resume after clean incomplete exit",
+        description: "Preserve the workspace and continue promptly",
+        state: "In Progress",
+        url: "https://example.org/issues/S-CLEAN-EXIT",
+        labels: ["orchestration"]
+      }
+
+      assert :ok = AgentRunner.run(issue, self())
+
+      assert_receive {:agent_run_outcome, "issue-clean-incomplete-exit", %{outcome: :continue, reason: :clean_incomplete_exit}},
+                     500
+
+      assert File.exists?(Path.join([workspace_root, "S-CLEAN-EXIT", "README.md"]))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner forwards timestamped codex updates to recipient" do
     test_root =
       Path.join(
