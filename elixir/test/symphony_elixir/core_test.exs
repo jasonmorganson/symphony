@@ -1553,7 +1553,13 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-b"
-    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == :no_worker_capacity
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "retry-issue") ==
+             "worker-a"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "other-pinned-issue") ==
+             :no_worker_capacity
   end
 
   test "select_worker_host_for_test does not reserve a durable host for a distant retry" do
