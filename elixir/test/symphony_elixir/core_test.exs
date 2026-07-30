@@ -1364,6 +1364,82 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == :no_worker_capacity
   end
 
+  test "restoring a drained worker wakes capacity-blocked retries without preserving deployment backoff" do
+    capacity_timer = Process.send_after(self(), :stale_capacity_retry, 60_000)
+    capacity_token = make_ref()
+    failure_timer = Process.send_after(self(), :unrelated_failure_retry, 60_000)
+    failure_token = make_ref()
+    still_drained_timer = Process.send_after(self(), :still_drained_retry, 60_000)
+    still_drained_token = make_ref()
+    future_due_at = System.monotonic_time(:millisecond) + 60_000
+
+    state = %Orchestrator.State{
+      drained_worker_hosts: MapSet.new(["worker-a", "worker-b"]),
+      retry_attempts: %{
+        "capacity-issue" => %{
+          attempt: 6,
+          timer_ref: capacity_timer,
+          retry_token: capacity_token,
+          due_at_ms: future_due_at,
+          identifier: "MT-600",
+          issue_url: "https://example.test/MT-600",
+          error: "no available orchestrator slots",
+          worker_host: "worker-a",
+          workspace_path: "/tmp/MT-600"
+        },
+        "failure-issue" => %{
+          attempt: 4,
+          timer_ref: failure_timer,
+          retry_token: failure_token,
+          due_at_ms: future_due_at,
+          identifier: "MT-601",
+          issue_url: "https://example.test/MT-601",
+          error: "agent exited: :boom",
+          worker_host: "worker-a",
+          workspace_path: "/tmp/MT-601"
+        },
+        "still-drained-issue" => %{
+          attempt: 5,
+          timer_ref: still_drained_timer,
+          retry_token: still_drained_token,
+          due_at_ms: future_due_at,
+          identifier: "MT-602",
+          issue_url: "https://example.test/MT-602",
+          error: "no available orchestrator slots",
+          worker_host: "worker-b",
+          workspace_path: "/tmp/MT-602"
+        }
+      }
+    }
+
+    updated =
+      Orchestrator.wake_capacity_blocked_retries_for_test(
+        state,
+        MapSet.new(["worker-a", "worker-b"]),
+        MapSet.new(["worker-b"])
+      )
+
+    assert %{
+             attempt: 0,
+             timer_ref: awakened_timer,
+             retry_token: awakened_token,
+             due_at_ms: due_at_ms
+           } = updated.retry_attempts["capacity-issue"]
+
+    assert is_reference(awakened_timer)
+    assert is_reference(awakened_token)
+    refute awakened_timer == capacity_timer
+    refute awakened_token == capacity_token
+    assert_due_in_range(due_at_ms, -100, 100)
+    assert_receive {:retry_issue, "capacity-issue", ^awakened_token}
+
+    assert updated.retry_attempts["failure-issue"].attempt == 4
+    assert updated.retry_attempts["failure-issue"].timer_ref == failure_timer
+    assert updated.retry_attempts["still-drained-issue"].attempt == 5
+    assert updated.retry_attempts["still-drained-issue"].timer_ref == still_drained_timer
+    refute_receive :stale_capacity_retry
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 

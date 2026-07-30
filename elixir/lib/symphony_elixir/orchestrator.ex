@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @deferred_continuation_retry_delay_ms 240_000
   @failure_retry_base_ms 10_000
+  @capacity_unavailable_error "no available orchestrator slots"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -556,6 +557,16 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec wake_capacity_blocked_retries_for_test(term(), MapSet.t(), MapSet.t()) :: term()
+  def wake_capacity_blocked_retries_for_test(
+        %State{} = state,
+        %MapSet{} = previously_drained,
+        %MapSet{} = currently_drained
+      ) do
+    wake_capacity_blocked_retries(state, previously_drained, currently_drained)
   end
 
   @doc false
@@ -1482,7 +1493,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt + 1,
          Map.merge(metadata, %{
            identifier: issue.identifier,
-           error: "no available orchestrator slots"
+           error: @capacity_unavailable_error
          })
        )}
     end
@@ -1826,7 +1837,10 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- validate_drained_worker_hosts(hosts, configured_hosts),
          drained = MapSet.new(hosts),
          :ok <- maybe_persist_drained_worker_hosts(state, drained) do
-      updated_state = %{state | drained_worker_hosts: drained}
+      updated_state =
+        state
+        |> Map.put(:drained_worker_hosts, drained)
+        |> wake_capacity_blocked_retries(state.drained_worker_hosts, drained)
 
       {:reply,
        {:ok,
@@ -1854,6 +1868,55 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  defp wake_capacity_blocked_retries(
+         %State{} = state,
+         %MapSet{} = previously_drained,
+         %MapSet{} = currently_drained
+       ) do
+    newly_available = MapSet.difference(previously_drained, currently_drained)
+    now_ms = System.monotonic_time(:millisecond)
+
+    retry_attempts =
+      Enum.reduce(state.retry_attempts, state.retry_attempts, fn {issue_id, retry}, retries ->
+        maybe_wake_capacity_blocked_retry(retries, issue_id, retry, newly_available, now_ms)
+      end)
+
+    %{state | retry_attempts: retry_attempts}
+  end
+
+  defp maybe_wake_capacity_blocked_retry(
+         retries,
+         issue_id,
+         retry,
+         newly_available,
+         now_ms
+       ) do
+    if retry[:error] == @capacity_unavailable_error and
+         MapSet.member?(newly_available, retry[:worker_host]) do
+      cancel_retry_timer(retry)
+      retry_token = make_ref()
+      timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, 0)
+
+      Logger.info("Worker capacity restored; waking issue_id=#{issue_id} issue_identifier=#{retry[:identifier] || issue_id} worker_host=#{retry[:worker_host]}")
+
+      Map.put(retries, issue_id, %{
+        retry
+        | attempt: 0,
+          timer_ref: timer_ref,
+          retry_token: retry_token,
+          due_at_ms: now_ms
+      })
+    else
+      retries
+    end
+  end
+
+  defp cancel_retry_timer(%{timer_ref: timer_ref}) when is_reference(timer_ref) do
+    Process.cancel_timer(timer_ref)
+  end
+
+  defp cancel_retry_timer(_retry), do: :ok
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
