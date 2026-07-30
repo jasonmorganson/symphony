@@ -149,6 +149,11 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.recovery_issue_ids` is an optional operator-controlled escape hatch
+  for work that was moved out of the configured active states by an external
+  scheduler or review lock. Only the listed issue IDs or identifiers are
+  fetched and admitted; ordinary backlog work remains ineligible. Remove an
+  entry after the workflow restores the issue to an active state.
 - `polling.request_interval_ms` spaces the starts of all Linear GraphQL
   requests across poll, retry, and tool paths. It defaults to `1500`; set it to
   `0` only when another shared limiter provides equivalent pacing.
