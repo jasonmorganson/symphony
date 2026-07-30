@@ -3,8 +3,9 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
-Agents may ask Symphony to defer redundant immediate continuation, but that bounded scheduling hint
-never changes tracker state; the orchestrator always revalidates the tracker before dispatch.
+Agents may ask Symphony to defer redundant immediate continuation. Unchanged non-merging work backs
+off progressively while merge reconciliation stays prompt; the scheduling hint never changes
+tracker state, and the orchestrator always revalidates the tracker before dispatch.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 

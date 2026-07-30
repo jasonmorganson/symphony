@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @deferred_continuation_retry_delay_ms 240_000
+  @max_deferred_continuation_retry_delay_ms 3_600_000
   @failure_retry_base_ms 10_000
   @capacity_unavailable_error "no available orchestrator slots"
   # Slightly above the dashboard render interval so "checking now…" can render.
@@ -49,6 +50,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      defer_streaks: %{},
       configured_worker_hosts: [],
       drained_worker_hosts: MapSet.new(),
       drain_state_path: nil,
@@ -295,6 +297,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_normal_continuation(state, issue_id, running_entry, session_id) do
     if deferred_completion?(running_entry) do
+      {state, defer_count} = record_defer_streak(state, issue_id, running_entry.issue)
+
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling deferred authoritative continuation check")
 
       state
@@ -303,6 +307,8 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
         delay_type: :deferred_continuation,
+        defer_count: defer_count,
+        issue_state: running_entry.issue.state,
         worker_host: Map.get(running_entry, :worker_host),
         workspace_path: Map.get(running_entry, :workspace_path)
       })
@@ -310,6 +316,7 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
       state
+      |> clear_defer_streak(issue_id)
       |> complete_issue(issue_id)
       |> schedule_issue_retry(issue_id, 1, %{
         identifier: running_entry.identifier,
@@ -329,6 +336,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp deferred_completion?(_running_entry), do: false
+
+  defp record_defer_streak(%State{} = state, issue_id, %Issue{} = issue) do
+    fingerprint = {issue.state, issue.updated_at}
+
+    defer_count =
+      case Map.get(state.defer_streaks, issue_id) do
+        %{fingerprint: ^fingerprint, count: count} when is_integer(count) and count > 0 -> count + 1
+        _ -> 1
+      end
+
+    {%{state | defer_streaks: Map.put(state.defer_streaks, issue_id, %{fingerprint: fingerprint, count: defer_count})}, defer_count}
+  end
+
+  defp clear_defer_streak(%State{} = state, issue_id) do
+    %{state | defer_streaks: Map.delete(state.defer_streaks, issue_id)}
+  end
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -766,7 +789,8 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            defer_streaks: Map.delete(state.defer_streaks, issue_id)
         }
 
       _ ->
@@ -971,6 +995,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        defer_streaks: Map.delete(state.defer_streaks, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
@@ -1559,16 +1584,35 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        defer_streaks: Map.delete(state.defer_streaks, issue_id)
     }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     case {metadata[:delay_type], attempt} do
       {:continuation, 1} -> @continuation_retry_delay_ms
-      {:deferred_continuation, 1} -> @deferred_continuation_retry_delay_ms
+      {:deferred_continuation, 1} -> deferred_continuation_retry_delay(metadata)
       _ -> failure_retry_delay(attempt)
     end
+  end
+
+  defp deferred_continuation_retry_delay(%{issue_state: "Merging"}),
+    do: @deferred_continuation_retry_delay_ms
+
+  defp deferred_continuation_retry_delay(metadata) do
+    defer_count =
+      case metadata[:defer_count] do
+        count when is_integer(count) and count > 0 -> count
+        _ -> 1
+      end
+
+    max_delay_power = min(defer_count - 1, 10)
+
+    min(
+      @deferred_continuation_retry_delay_ms * (1 <<< max_delay_power),
+      @max_deferred_continuation_retry_delay_ms
+    )
   end
 
   defp failure_retry_delay(attempt) do
