@@ -676,9 +676,11 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session. A valid `defer` hint instead schedules a bounded authoritative tracker recheck after
-  about 4 minutes. Consecutive deferrals whose tracker state and `updated_at` are unchanged MUST
-  back off exponentially to a one-hour cap, except that `Merging` MUST retain the four-minute
-  reconciliation cadence. A tracker state or `updated_at` change MUST reset the defer streak.
+  about 4 minutes. Consecutive deferrals whose tracker state is unchanged and whose `updated_at`
+  has not advanced between worker turns MUST back off exponentially to a one-hour cap, except that
+  `Merging` MUST retain the four-minute reconciliation cadence. Tracker updates made during the
+  worker's own turn establish the next baseline; a state change or timestamp advance between turns
+  MUST reset the defer streak.
 
 ### 7.2 Run Attempt Lifecycle
 

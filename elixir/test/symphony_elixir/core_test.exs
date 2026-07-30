@@ -1233,7 +1233,7 @@ defmodule SymphonyElixir.CoreTest do
 
     original_updated_at = ~U[2026-07-30 09:00:00Z]
 
-    defer_issue = fn ref, updated_at ->
+    defer_issue = fn ref, observed_before_updated_at, observed_after_updated_at ->
       running_entry = %{
         pid: self(),
         ref: ref,
@@ -1242,7 +1242,7 @@ defmodule SymphonyElixir.CoreTest do
           id: issue_id,
           identifier: "MT-HUMAN-REVIEW-DEFER",
           state: "Human Review",
-          updated_at: updated_at
+          updated_at: observed_after_updated_at
         },
         started_at: DateTime.utc_now(),
         completion: nil
@@ -1257,7 +1257,14 @@ defmodule SymphonyElixir.CoreTest do
 
       send(
         pid,
-        {:agent_run_outcome, issue_id, %{outcome: :defer, reason: "External evidence pending."}}
+        {:agent_run_outcome, issue_id,
+         %{
+           outcome: :defer,
+           reason: "External evidence pending.",
+           issue_state: "Human Review",
+           observed_before_updated_at: observed_before_updated_at,
+           observed_after_updated_at: observed_after_updated_at
+         }}
       )
 
       send(pid, {:DOWN, ref, :process, self(), :normal})
@@ -1265,15 +1272,18 @@ defmodule SymphonyElixir.CoreTest do
       :sys.get_state(pid)
     end
 
-    first_state = defer_issue.(make_ref(), original_updated_at)
+    first_after = DateTime.add(original_updated_at, 10, :second)
+    first_state = defer_issue.(make_ref(), original_updated_at, first_after)
     assert %{due_at_ms: first_due_at_ms} = first_state.retry_attempts[issue_id]
     assert_due_in_range(first_due_at_ms, 239_000, 240_100)
 
-    second_state = defer_issue.(make_ref(), original_updated_at)
+    second_after = DateTime.add(first_after, 10, :second)
+    second_state = defer_issue.(make_ref(), first_after, second_after)
     assert %{due_at_ms: second_due_at_ms} = second_state.retry_attempts[issue_id]
     assert_due_in_range(second_due_at_ms, 479_000, 480_100)
 
-    changed_state = defer_issue.(make_ref(), DateTime.add(original_updated_at, 60, :second))
+    external_change = DateTime.add(second_after, 60, :second)
+    changed_state = defer_issue.(make_ref(), external_change, external_change)
     assert %{due_at_ms: changed_due_at_ms} = changed_state.retry_attempts[issue_id]
     assert_due_in_range(changed_due_at_ms, 239_000, 240_100)
   end

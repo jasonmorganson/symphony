@@ -177,9 +177,11 @@ Notes:
   fail-open default. An agent may report `defer` when another immediate turn would only repeat
   completed work or wait on external evidence; Symphony then performs its next authoritative
   tracker recheck after about four minutes. Consecutive unchanged non-`Merging` deferrals back off
-  exponentially to a one-hour cap and reset when tracker state or `updated_at` changes. `Merging`
-  reconciliation remains on the four-minute cadence. This is only a scheduling hint: it never
-  changes tracker state and it does not accept tracker state names.
+  exponentially to a one-hour cap and reset when tracker state changes or `updated_at` advances
+  between deferred turns. Updates made during the worker's own turn become the next baseline and
+  do not masquerade as external progress. `Merging` reconciliation remains on the four-minute
+  cadence. This is only a scheduling hint: it never changes tracker state and it does not accept
+  tracker state names.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

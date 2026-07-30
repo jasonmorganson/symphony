@@ -120,7 +120,11 @@ defmodule SymphonyElixir.AgentRunner do
             send_agent_run_outcome(
               codex_update_recipient,
               refreshed_issue,
-              turn_outcome
+              Map.merge(turn_outcome, %{
+                issue_state: refreshed_issue.state,
+                observed_before_updated_at: issue.updated_at,
+                observed_after_updated_at: refreshed_issue.updated_at
+              })
             )
 
             :ok
