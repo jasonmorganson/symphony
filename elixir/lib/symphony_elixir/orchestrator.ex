@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @deferred_continuation_retry_delay_ms 240_000
+  @retry_worker_reservation_window_ms @deferred_continuation_retry_delay_ms
   @max_deferred_continuation_retry_delay_ms 3_600_000
   @failure_retry_base_ms 10_000
   @capacity_unavailable_error "no available orchestrator slots"
@@ -1731,7 +1732,14 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host_slots_available?(state, host)
       end)
 
-    choose_available_worker_host(state, available_hosts, preferred_worker_host)
+    selectable_hosts =
+      if is_binary(preferred_worker_host) and preferred_worker_host != "" do
+        available_hosts
+      else
+        Enum.reject(available_hosts, &worker_host_reserved_for_retry?(state, &1))
+      end
+
+    choose_available_worker_host(state, selectable_hosts, preferred_worker_host)
   end
 
   defp choose_available_worker_host(_state, [], _preferred_worker_host),
@@ -1780,6 +1788,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp worker_host_reserved_for_retry?(%State{} = state, worker_host)
+       when is_binary(worker_host) do
+    reservation_deadline_ms =
+      System.monotonic_time(:millisecond) + @retry_worker_reservation_window_ms
+
+    Enum.any?(state.retry_attempts, fn
+      {_issue_id, %{worker_host: ^worker_host, due_at_ms: due_at_ms}}
+      when is_integer(due_at_ms) ->
+        due_at_ms <= reservation_deadline_ms
+
+      _ ->
+        false
+    end)
+  end
+
   defp available_worker_hosts(%State{} = state) do
     Enum.reject(state.configured_worker_hosts, &MapSet.member?(state.drained_worker_hosts, &1))
   end
@@ -1793,6 +1816,7 @@ defmodule SymphonyElixir.Orchestrator do
     worker_slots =
       state
       |> available_worker_hosts()
+      |> Enum.reject(&worker_host_reserved_for_retry?(state, &1))
       |> Enum.reduce(0, fn host, total ->
         available =
           case per_host_limit do
