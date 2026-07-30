@@ -602,6 +602,56 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "explicit recovery keeps its active claim while outside active states" do
+    issue_id = "issue-recovery"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_recovery_issue_ids: [issue_id],
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "A-295",
+          issue: %Issue{id: issue_id, state: "Todo", identifier: "A-295"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "A-295",
+      state: "Backlog",
+      title: "Recover stranded active work",
+      description: "Previously active",
+      dispatchable: true,
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert updated_state.running[issue_id].issue.state == "Backlog"
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+
+    send(agent_pid, :stop)
+  end
+
   test "terminal issue state stops running agent before cleaning workspace" do
     test_root =
       Path.join(

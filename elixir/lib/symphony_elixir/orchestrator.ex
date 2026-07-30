@@ -623,6 +623,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
+      configured_recovery_issue?(issue) ->
+        refresh_running_issue_state(state, issue)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
