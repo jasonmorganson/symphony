@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
+      field(:recovery_issue_ids, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
       field(:observed_states, {:array, :string}, default: [])
       field(:terminal_states, {:array, :string})
@@ -74,6 +75,7 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :provider,
           :required_labels,
+          :recovery_issue_ids,
           :active_states,
           :observed_states,
           :terminal_states
@@ -83,6 +85,12 @@ defmodule SymphonyElixir.Config.Schema do
       |> update_change(:required_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
+      |> update_change(:recovery_issue_ids, fn issue_ids ->
+        issue_ids
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
         |> Enum.uniq()
       end)
     end

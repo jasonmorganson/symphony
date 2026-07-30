@@ -18,6 +18,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.polling.request_interval_ms == 1_500
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert config.tracker.recovery_issue_ids == []
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
 
@@ -32,6 +33,12 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: 45_000)
     assert Config.settings!().polling.interval_ms == 45_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_recovery_issue_ids: [" A-295 ", "A-295", ""]
+    )
+
+    assert Config.settings!().tracker.recovery_issue_ids == ["A-295"]
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -104,6 +111,48 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "only explicitly configured stranded issues can dispatch outside active states" do
+    issue = %Issue{
+      id: "issue-recovery",
+      identifier: "A-295",
+      title: "Recover stranded active work",
+      state: "Backlog",
+      dispatchable: true,
+      labels: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, %Orchestrator.State{})
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_recovery_issue_ids: ["A-295"]
+    )
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, %Orchestrator.State{})
+
+    refute Orchestrator.should_dispatch_issue_for_test(
+             %{issue | id: "other", identifier: "A-999"},
+             %Orchestrator.State{}
+           )
+
+    refute Orchestrator.should_dispatch_issue_for_test(
+             %{issue | state: "Done"},
+             %Orchestrator.State{}
+           )
+  end
+
+  test "claimed, running, retrying, and blocked recoveries do not add poll requests" do
+    configured_ids = ["A-claimed", "A-running", "A-retrying", "A-blocked", "A-pending"]
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new(["A-claimed"]),
+      running: %{"running-id" => %{identifier: "A-running"}},
+      retry_attempts: %{"retry-id" => %{identifier: "A-retrying"}},
+      blocked: %{"blocked-id" => %{issue: %Issue{identifier: "A-blocked"}}}
+    }
+
+    assert Orchestrator.pending_recovery_issue_ids_for_test(configured_ids, state) == ["A-pending"]
   end
 
   test "current WORKFLOW.md file is valid and complete" do

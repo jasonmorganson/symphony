@@ -362,18 +362,20 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          config = Config.settings!(),
          {:ok, issues} <-
-           Tracker.fetch_issues_by_states(Enum.uniq(config.tracker.active_states ++ config.tracker.observed_states)) do
+           Tracker.fetch_issues_by_states(Enum.uniq(config.tracker.active_states ++ config.tracker.observed_states)),
+         {:ok, recovery_issues} <- fetch_pending_recovery_issues(config, state) do
       active_states = active_state_set()
       observed_states = issue_state_set(config.tracker.observed_states)
       {active_issues, observed_issues} = partition_issues(issues, active_states, observed_states)
+      dispatch_issues = merge_dispatch_issues(active_issues, recovery_issues)
 
       state =
         state
-        |> observe_demand(active_issues)
+        |> observe_demand(dispatch_issues)
         |> observe_issues(observed_issues)
 
       if available_slots(state) > 0 do
-        choose_issues(active_issues, state)
+        choose_issues(dispatch_issues, state)
       else
         state
       end
@@ -574,6 +576,13 @@ defmodule SymphonyElixir.Orchestrator do
   def demand_from_issues_for_test(issues, %State{} = state) when is_list(issues) do
     state = observe_demand(state, issues)
     %{eligible: state.demand_eligible, observed_at: state.demand_observed_at}
+  end
+
+  @doc false
+  @spec pending_recovery_issue_ids_for_test([String.t()], term()) :: [String.t()]
+  def pending_recovery_issue_ids_for_test(configured_ids, %State{} = state)
+      when is_list(configured_ids) do
+    pending_recovery_issue_ids(configured_ids, state)
   end
 
   @spec set_drained_worker_hosts([String.t()]) ::
@@ -986,6 +995,44 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  defp fetch_pending_recovery_issues(config, state) do
+    pending_ids =
+      if available_slots(state) > 0 and worker_slots_available?(state) do
+        pending_recovery_issue_ids(config.tracker.recovery_issue_ids, state)
+      else
+        []
+      end
+
+    Tracker.fetch_issues_by_ids(pending_ids)
+  end
+
+  defp pending_recovery_issue_ids(configured_ids, state) do
+    Enum.reject(configured_ids, &recovery_issue_claimed?(&1, state))
+  end
+
+  defp recovery_issue_claimed?(configured_id, state) do
+    Enum.any?(state.claimed, &(&1 == configured_id)) or
+      recovery_entry_present?(state.running, configured_id) or
+      recovery_entry_present?(state.retry_attempts, configured_id) or
+      recovery_entry_present?(state.blocked, configured_id)
+  end
+
+  defp recovery_entry_present?(entries, configured_id) do
+    Enum.any?(entries, fn {issue_id, entry} ->
+      issue_id == configured_id or
+        Map.get(entry, :identifier) == configured_id or
+        get_in(entry, [:issue, Access.key(:identifier)]) == configured_id
+    end)
+  end
+
+  defp merge_dispatch_issues(active_issues, recovery_issues) do
+    (active_issues ++ recovery_issues)
+    |> Enum.uniq_by(fn
+      %Issue{id: id} -> id
+      issue -> issue
+    end)
+  end
+
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn
       %Issue{} = issue ->
@@ -1078,11 +1125,16 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       Issue.routable?(issue, required_labels) and
-      active_issue_state?(state_name, active_states) and
+      (active_issue_state?(state_name, active_states) or configured_recovery_issue?(issue)) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states, _required_labels), do: false
+
+  defp configured_recovery_issue?(%Issue{id: id, identifier: identifier}) do
+    configured_ids = Config.settings!().tracker.recovery_issue_ids
+    id in configured_ids or identifier in configured_ids
+  end
 
   defp observe_demand(%State{} = state, issues) when is_list(issues) do
     active_states = active_state_set()
