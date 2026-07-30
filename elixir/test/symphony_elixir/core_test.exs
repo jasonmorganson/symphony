@@ -1537,6 +1537,43 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == :no_worker_capacity
   end
 
+  test "select_worker_host_for_test reserves a durable host for an imminent retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      retry_attempts: %{
+        "retry-issue" => %{
+          worker_host: "worker-a",
+          due_at_ms: System.monotonic_time(:millisecond) + 60_000
+        }
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-b"
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
+  end
+
+  test "select_worker_host_for_test does not reserve a durable host for a distant retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      retry_attempts: %{
+        "retry-issue" => %{
+          worker_host: "worker-a",
+          due_at_ms: System.monotonic_time(:millisecond) + 600_000
+        }
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-a"
+  end
+
   test "restoring a drained worker wakes capacity-blocked retries without preserving deployment backoff" do
     capacity_timer = Process.send_after(self(), :stale_capacity_retry, 60_000)
     capacity_token = make_ref()
