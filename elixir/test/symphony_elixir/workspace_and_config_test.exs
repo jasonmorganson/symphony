@@ -1730,6 +1730,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                   }}
                end
              )
+
+    assert :ok = RateLimit.activate(0)
+    assert :ok = RateLimit.check()
   end
 
   test "linear requests are proactively spaced without bypassing a later cooldown" do
