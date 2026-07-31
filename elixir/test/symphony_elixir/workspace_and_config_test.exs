@@ -1668,6 +1668,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
   test "linear client recognizes atom-keyed Linear rate-limit wrappers" do
     rate_limit_name = Module.concat(__MODULE__, :AtomKeyedLinearRateLimit)
     start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
