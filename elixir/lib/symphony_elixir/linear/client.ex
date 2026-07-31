@@ -378,14 +378,17 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp rate_limit_retry_after_ms(_response), do: :error
 
-  defp rate_limited_body?(%{"errors" => errors}) when is_list(errors) do
-    Enum.any?(errors, fn
-      %{"extensions" => extensions} when is_map(extensions) ->
-        extensions["code"] == "RATELIMITED" or extensions["statusCode"] == 429
+  defp rate_limited_body?(body) when is_map(body) do
+    errors = Map.get(body, "errors") || Map.get(body, :errors)
 
-      _ ->
-        false
-    end)
+    is_list(errors) and
+      Enum.any?(errors, fn error ->
+        extensions = Map.get(error, "extensions") || Map.get(error, :extensions)
+
+        is_map(extensions) and
+          ((Map.get(extensions, "code") || Map.get(extensions, :code)) == "RATELIMITED" or
+             (Map.get(extensions, "statusCode") || Map.get(extensions, :statusCode)) == 429)
+      end)
   end
 
   defp rate_limited_body?(_body), do: false
