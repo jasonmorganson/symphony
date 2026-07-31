@@ -17,6 +17,7 @@ defmodule SymphonyElixirWeb.Presenter do
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
             blocked: length(Map.get(snapshot, :blocked, [])),
+            pending: length(Map.get(snapshot, :pending, [])),
             dependency_blocked: length(Map.get(snapshot, :dependency_blocked, [])),
             observed: snapshot |> Map.get(:observed, %{}) |> Map.get(:issues, []) |> length()
           },
@@ -32,6 +33,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          pending: Enum.map(Map.get(snapshot, :pending, []), &pending_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -117,6 +119,17 @@ defmodule SymphonyElixirWeb.Presenter do
             state: Map.get(blocker, :state)
           }
         end)
+    }
+  end
+
+  defp pending_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      identifier: entry.identifier,
+      issue_url: entry.issue_url,
+      state: entry.state,
+      worker_host: entry.worker_host,
+      priority: entry.priority
     }
   end
 

@@ -32,6 +32,28 @@ defmodule SymphonyElixir.WorkerAffinityStoreTest do
              WorkerAffinityStore.put(path, %{}, "issue-1", "worker-9", ["worker-0"])
   end
 
+  test "rejects assigning one worker to multiple issue owners" do
+    hosts = ["worker-0", "worker-1"]
+
+    assert {:error, {:worker_affinity_owned, "worker-0", "issue-1"}} =
+             WorkerAffinityStore.put(
+               nil,
+               %{"issue-1" => "worker-0"},
+               "issue-2",
+               "worker-0",
+               hosts
+             )
+
+    assert {:ok, %{"issue-1" => "worker-0", "issue-2" => "worker-1"}} =
+             WorkerAffinityStore.put(
+               nil,
+               %{"issue-1" => "worker-0"},
+               "issue-2",
+               "worker-1",
+               hosts
+             )
+  end
+
   test "promotes an explicit migration seed only when durable state is absent" do
     root = Path.join(System.tmp_dir!(), "symphony-affinity-#{System.unique_integer([:positive])}")
     path = Path.join(root, "affinities.json")

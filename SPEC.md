@@ -2312,6 +2312,10 @@ Extension config:
 - SSH hosts MAY be treated as a pool for dispatch.
 - Implementations with durable affinity MUST select the recorded host on startup, continuation,
   retry, and stalled-session recovery.
+- A host MUST NOT receive a new durable affinity while another issue owns it. If legacy durable
+  state names multiple issues for one host, the orchestrator MUST elect exactly one owner
+  (preserving a running owner first, then the earliest retry), surface the other issue as pending,
+  and treat reassignment to an unowned host as an explicit new attempt.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
 - Drained hosts MUST remain ineligible for new dispatches, while active sessions already assigned

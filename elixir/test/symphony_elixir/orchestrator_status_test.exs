@@ -812,6 +812,47 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert due_in_ms > 0
   end
 
+  test "orchestrator snapshot identifies eligible pending work" do
+    orchestrator_name = Module.concat(__MODULE__, :PendingOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    issue = %Issue{
+      id: "pending-id",
+      identifier: "MT-PENDING",
+      title: "Pending after restart",
+      state: "Todo",
+      url: "https://example.org/issues/MT-PENDING",
+      priority: 1,
+      dispatchable: true,
+      labels: []
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | eligible_pending_issues: [issue],
+          worker_affinities: %{"pending-id" => "worker-a"}
+      }
+    end)
+
+    assert %{pending: [pending]} = GenServer.call(pid, :snapshot)
+
+    assert pending == %{
+             issue_id: "pending-id",
+             identifier: "MT-PENDING",
+             issue_url: "https://example.org/issues/MT-PENDING",
+             state: "Todo",
+             worker_host: "worker-a",
+             priority: 1
+           }
+  end
+
   test "orchestrator snapshot includes poll countdown and checking status" do
     orchestrator_name = Module.concat(__MODULE__, :PollingSnapshotOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
