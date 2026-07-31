@@ -21,31 +21,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
-  defmodule FakeReclamationClient do
-    alias SymphonyElixir.{Config, Tracker.Issue}
-
-    def fetch_issues_by_ids([first, second]) do
-      settings = Config.settings!().tracker
-      now = DateTime.utc_now() |> DateTime.truncate(:second)
-
-      {:ok,
-       [
-         %Issue{
-           id: first,
-           identifier: first,
-           state: hd(settings.terminal_states),
-           updated_at: now
-         },
-         %Issue{
-           id: second,
-           identifier: second,
-           state: hd(settings.active_states),
-           updated_at: now
-         }
-       ]}
-    end
-  end
-
   defmodule SlowOrchestrator do
     use GenServer
 
@@ -81,19 +56,6 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
-    end
-
-    def handle_call({:set_drained_worker_hosts, hosts}, _from, state) do
-      configured_hosts = state |> Keyword.fetch!(:snapshot) |> get_in([:worker_pool, :configured_hosts])
-      drained_hosts = Enum.sort(hosts)
-
-      {:reply,
-       {:ok,
-        %{
-          configured_hosts: configured_hosts,
-          drained_hosts: drained_hosts,
-          active_drained_hosts: []
-        }}, state}
     end
   end
 
@@ -300,58 +262,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{
-               "running" => 1,
-               "retrying" => 1,
-               "blocked" => 1,
-               "pending" => 0,
-               "dependency_blocked" => 1,
-               "observed" => 1
-             },
-             "demand" => %{
-               "eligible" => 4,
-               "dependency_blocked" => 1,
-               "observed_at" => "2026-07-28T10:00:00Z"
-             },
-             "dependency_blocked" => [
-               %{
-                 "issue_id" => "issue-waiting",
-                 "identifier" => "MT-WAITING",
-                 "state" => "Todo",
-                 "url" => "https://example.org/issues/MT-WAITING",
-                 "priority" => 2,
-                 "blockers" => [
-                   %{
-                     "id" => "issue-parent",
-                     "identifier" => "MT-PARENT",
-                     "state" => "Human Review"
-                   }
-                 ]
-               }
-             ],
-             "observed" => %{
-               "observed_at" => "2026-07-28T10:00:00Z",
-               "issues" => [
-                 %{
-                   "issue_id" => "issue-review",
-                   "identifier" => "MT-REVIEW",
-                   "state" => "Human Review",
-                   "url" => "https://example.org/issues/MT-REVIEW",
-                   "updated_at" => "2026-07-28T09:55:00Z",
-                   "age_seconds" => state_payload["observed"]["issues"] |> List.first() |> Map.fetch!("age_seconds")
-                 }
-               ]
-             },
-             "worker_affinities" => [],
-             "worker_pool" => %{
-               "configured" => 2,
-               "drained" => 1,
-               "available" => 1,
-               "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
-               "drained_hosts" => ["symphony-worker-1"],
-               "available_hosts" => ["symphony-worker-0"],
-               "available_slots" => 1
-             },
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -397,7 +308,6 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
-             "pending" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -466,73 +376,6 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
-  end
-
-  test "worker drain updates require authorization and return the exact drain set" do
-    orchestrator_name = Module.concat(__MODULE__, :WorkerDrainApiOrchestrator)
-
-    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: static_snapshot()})
-
-    start_test_endpoint(
-      orchestrator: orchestrator_name,
-      snapshot_timeout_ms: 50,
-      worker_drain_token: String.duplicate("d", 32)
-    )
-
-    assert json_response(
-             put(build_conn(), "/api/v1/worker-drains", %{
-               "drained_worker_hosts" => ["symphony-worker-1"]
-             }),
-             401
-           )["error"]["code"] == "unauthorized"
-
-    conn =
-      build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer " <> String.duplicate("d", 32))
-      |> put("/api/v1/worker-drains", %{
-        "drained_worker_hosts" => ["symphony-worker-1"]
-      })
-
-    assert json_response(conn, 200) == %{
-             "configured_hosts" => ["symphony-worker-0", "symphony-worker-1"],
-             "drained_hosts" => ["symphony-worker-1"],
-             "active_drained_hosts" => []
-           }
-  end
-
-  test "workspace reclamation proxies normalized terminal state without exposing tracker credentials" do
-    Application.put_env(:symphony_elixir, :linear_client_module, FakeReclamationClient)
-    start_test_endpoint(worker_drain_token: String.duplicate("r", 32))
-
-    assert json_response(
-             post(build_conn(), "/api/v1/workspace-reclamation", %{
-               "issue_identifiers" => ["A-218", "A-222"]
-             }),
-             401
-           )["error"]["code"] == "unauthorized"
-
-    response =
-      build_conn()
-      |> Plug.Conn.put_req_header("authorization", "Bearer " <> String.duplicate("r", 32))
-      |> post("/api/v1/workspace-reclamation", %{
-        "issue_identifiers" => ["A-218", "A-222"]
-      })
-      |> json_response(200)
-
-    assert [
-             %{
-               "issue_identifier" => "A-218",
-               "terminal" => true,
-               "terminal_at" => terminal_at
-             },
-             %{
-               "issue_identifier" => "A-222",
-               "terminal" => false,
-               "terminal_at" => nil
-             }
-           ] = response["issues"]
-
-    assert {:ok, _terminal_at, 0} = DateTime.from_iso8601(terminal_at)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -767,15 +610,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-
-    assert response.body["counts"] == %{
-             "running" => 1,
-             "retrying" => 1,
-             "blocked" => 1,
-             "pending" => 0,
-             "dependency_blocked" => 1,
-             "observed" => 1
-           }
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -867,45 +702,6 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
-      demand: %{
-        eligible: 4,
-        dependency_blocked: 1,
-        observed_at: ~U[2026-07-28 10:00:00Z]
-      },
-      dependency_blocked: [
-        %SymphonyElixir.Tracker.Issue{
-          id: "issue-waiting",
-          identifier: "MT-WAITING",
-          state: "Todo",
-          url: "https://example.org/issues/MT-WAITING",
-          priority: 2,
-          dispatchable: false,
-          blocked_by: [
-            %{id: "issue-parent", identifier: "MT-PARENT", state: "Human Review"}
-          ]
-        }
-      ],
-      observed: %{
-        observed_at: ~U[2026-07-28 10:00:00Z],
-        issues: [
-          %SymphonyElixir.Tracker.Issue{
-            id: "issue-review",
-            identifier: "MT-REVIEW",
-            state: "Human Review",
-            url: "https://example.org/issues/MT-REVIEW",
-            updated_at: ~U[2026-07-28 09:55:00Z]
-          }
-        ]
-      },
-      worker_pool: %{
-        configured: 2,
-        drained: 1,
-        available: 1,
-        configured_hosts: ["symphony-worker-0", "symphony-worker-1"],
-        drained_hosts: ["symphony-worker-1"],
-        available_hosts: ["symphony-worker-0"],
-        available_slots: 1
-      },
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }

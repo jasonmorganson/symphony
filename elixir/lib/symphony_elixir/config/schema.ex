@@ -56,9 +56,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
-      field(:recovery_issue_ids, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
-      field(:observed_states, {:array, :string}, default: [])
       field(:terminal_states, {:array, :string})
     end
 
@@ -75,9 +73,7 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :provider,
           :required_labels,
-          :recovery_issue_ids,
           :active_states,
-          :observed_states,
           :terminal_states
         ],
         empty_values: []
@@ -85,12 +81,6 @@ defmodule SymphonyElixir.Config.Schema do
       |> update_change(:required_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
-        |> Enum.uniq()
-      end)
-      |> update_change(:recovery_issue_ids, fn issue_ids ->
-        issue_ids
-        |> Enum.map(&String.trim/1)
-        |> Enum.reject(&(&1 == ""))
         |> Enum.uniq()
       end)
     end
@@ -104,15 +94,13 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:interval_ms, :integer, default: 30_000)
-      field(:request_interval_ms, :integer, default: 1_500)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:interval_ms, :request_interval_ms], empty_values: [])
+      |> cast(attrs, [:interval_ms], empty_values: [])
       |> validate_number(:interval_ms, greater_than: 0)
-      |> validate_number(:request_interval_ms, greater_than_or_equal_to: 0)
     end
   end
 
@@ -142,25 +130,12 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
-      field(:drain_state_path, :string)
-      field(:affinity_state_path, :string)
-      field(:affinity_seed_path, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(
-        attrs,
-        [
-          :ssh_hosts,
-          :max_concurrent_agents_per_host,
-          :drain_state_path,
-          :affinity_state_path,
-          :affinity_seed_path
-        ],
-        empty_values: []
-      )
+      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
     end
   end
@@ -479,20 +454,13 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
-    worker = %{
-      settings.worker
-      | drain_state_path: resolve_optional_path_value(settings.worker.drain_state_path),
-        affinity_state_path: resolve_optional_path_value(settings.worker.affinity_state_path),
-        affinity_seed_path: resolve_optional_path_value(settings.worker.affinity_seed_path)
-    }
-
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, worker: worker, codex: codex}
+    %{settings | tracker: tracker, workspace: workspace, codex: codex}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -543,15 +511,6 @@ defmodule SymphonyElixir.Config.Schema do
 
       path ->
         path
-    end
-  end
-
-  defp resolve_optional_path_value(nil), do: nil
-
-  defp resolve_optional_path_value(value) when is_binary(value) do
-    case resolve_path_value(value, nil) do
-      nil -> nil
-      path -> Path.expand(path)
     end
   end
 

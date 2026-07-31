@@ -98,12 +98,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
-            <p class="metric-label">Dependency blocked</p>
-            <p class="metric-value numeric"><%= @payload.counts.dependency_blocked %></p>
-            <p class="metric-detail">Active Todo issues waiting on nonterminal blockers.</p>
-          </article>
-
-          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -116,47 +110,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
-        </section>
-
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Dependency-blocked work</h2>
-              <p class="section-copy">
-                Active Todo issues excluded from dispatch until their Linear blockers become terminal.
-              </p>
-            </div>
-          </div>
-
-          <%= if @payload.dependency_blocked == [] do %>
-            <p class="empty-state">No active Todo issues are dependency blocked.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Priority</th>
-                    <th>Waiting on</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.dependency_blocked}>
-                    <td>
-                      <.issue_identifier identifier={entry.identifier} url={entry.url} />
-                    </td>
-                    <td><%= entry.priority || "n/a" %></td>
-                    <td>
-                      <span :for={blocker <- entry.blockers} class="mono">
-                        <%= blocker.identifier || blocker.id || "unknown" %>
-                        (<%= blocker.state || "unknown" %>)<br />
-                      </span>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
         </section>
 
         <section class="section-card">

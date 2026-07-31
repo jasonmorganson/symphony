@@ -467,64 +467,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     snapshot = GenServer.call(pid, :snapshot)
     assert snapshot.rate_limits == rate_limits
-
-    :sys.replace_state(pid, &%{&1 | codex_rate_limits: nil})
-
-    sparse_rate_limits = %{
-      "limitId" => nil,
-      "limitName" => nil,
-      "primary" => %{
-        "usedPercent" => 82.0,
-        "windowDurationMins" => 300,
-        "resetsAt" => 1_786_000_000
-      },
-      "secondary" => nil,
-      "credits" => nil
-    }
-
-    send(
-      pid,
-      {:codex_worker_update, issue_id,
-       %{
-         event: :notification,
-         payload: %{
-           "method" => "account/rateLimits/updated",
-           "params" => %{"rateLimits" => sparse_rate_limits}
-         },
-         timestamp: DateTime.utc_now()
-       }}
-    )
-
-    snapshot = GenServer.call(pid, :snapshot)
-    assert snapshot.rate_limits == sparse_rate_limits
-
-    send(
-      pid,
-      {:codex_worker_update, issue_id,
-       %{
-         event: :notification,
-         payload: %{
-           "method" => "account/rateLimits/updated",
-           "params" => %{
-             "rateLimits" => %{
-               "limitId" => "codex",
-               "primary" => nil,
-               "secondary" => %{
-                 "usedPercent" => 14.0,
-                 "windowDurationMins" => 10,
-                 "resetsAt" => 1_786_000_100
-               }
-             }
-           }
-         },
-         timestamp: DateTime.utc_now()
-       }}
-    )
-
-    snapshot = GenServer.call(pid, :snapshot)
-    assert snapshot.rate_limits["limitId"] == "codex"
-    assert snapshot.rate_limits["primary"] == sparse_rate_limits["primary"]
-    assert snapshot.rate_limits["secondary"]["usedPercent"] == 14.0
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do
@@ -810,47 +752,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ] = snapshot.retrying
 
     assert due_in_ms > 0
-  end
-
-  test "orchestrator snapshot identifies eligible pending work" do
-    orchestrator_name = Module.concat(__MODULE__, :PendingOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    issue = %Issue{
-      id: "pending-id",
-      identifier: "MT-PENDING",
-      title: "Pending after restart",
-      state: "Todo",
-      url: "https://example.org/issues/MT-PENDING",
-      priority: 1,
-      dispatchable: true,
-      labels: []
-    }
-
-    :sys.replace_state(pid, fn state ->
-      %{
-        state
-        | eligible_pending_issues: [issue],
-          worker_affinities: %{"pending-id" => "worker-a"}
-      }
-    end)
-
-    assert %{pending: [pending]} = GenServer.call(pid, :snapshot)
-
-    assert pending == %{
-             issue_id: "pending-id",
-             identifier: "MT-PENDING",
-             issue_url: "https://example.org/issues/MT-PENDING",
-             state: "Todo",
-             worker_host: "worker-a",
-             priority: 1
-           }
   end
 
   test "orchestrator snapshot includes poll countdown and checking status" do

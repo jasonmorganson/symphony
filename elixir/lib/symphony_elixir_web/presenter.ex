@@ -16,24 +16,11 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, [])),
-            pending: length(Map.get(snapshot, :pending, [])),
-            dependency_blocked: length(Map.get(snapshot, :dependency_blocked, [])),
-            observed: snapshot |> Map.get(:observed, %{}) |> Map.get(:issues, []) |> length()
+            blocked: length(Map.get(snapshot, :blocked, []))
           },
-          demand: demand_payload(Map.get(snapshot, :demand)),
-          dependency_blocked:
-            Enum.map(
-              Map.get(snapshot, :dependency_blocked, []),
-              &dependency_blocked_issue_payload/1
-            ),
-          observed: observed_payload(Map.get(snapshot, :observed)),
-          worker_pool: Map.get(snapshot, :worker_pool),
-          worker_affinities: Map.get(snapshot, :worker_affinities, []),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
-          pending: Enum.map(Map.get(snapshot, :pending, []), &pending_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -75,90 +62,6 @@ defmodule SymphonyElixirWeb.Presenter do
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
   end
-
-  @spec worker_drains_payload(GenServer.name(), [String.t()]) ::
-          {:ok, map()} | {:error, term()}
-  def worker_drains_payload(orchestrator, hosts) do
-    case Orchestrator.set_drained_worker_hosts(orchestrator, hosts) do
-      {:ok, payload} -> {:ok, payload}
-      {:error, reason} -> {:error, reason}
-      :timeout -> {:error, :timeout}
-      :unavailable -> {:error, :unavailable}
-    end
-  end
-
-  defp demand_payload(%{eligible: eligible, observed_at: observed_at} = demand)
-       when is_integer(eligible) and eligible >= 0 do
-    dependency_blocked = Map.get(demand, :dependency_blocked, 0)
-
-    %{
-      eligible: eligible,
-      dependency_blocked:
-        if(is_integer(dependency_blocked) and dependency_blocked >= 0,
-          do: dependency_blocked,
-          else: 0
-        ),
-      observed_at: iso8601(observed_at)
-    }
-  end
-
-  defp demand_payload(_demand), do: %{eligible: 0, dependency_blocked: 0, observed_at: nil}
-
-  defp dependency_blocked_issue_payload(issue) do
-    %{
-      issue_id: issue.id,
-      identifier: issue.identifier,
-      state: issue.state,
-      url: issue.url,
-      priority: issue.priority,
-      blockers:
-        Enum.map(issue.blocked_by, fn blocker ->
-          %{
-            id: Map.get(blocker, :id),
-            identifier: Map.get(blocker, :identifier),
-            state: Map.get(blocker, :state)
-          }
-        end)
-    }
-  end
-
-  defp pending_entry_payload(entry) do
-    %{
-      issue_id: entry.issue_id,
-      identifier: entry.identifier,
-      issue_url: entry.issue_url,
-      state: entry.state,
-      worker_host: entry.worker_host,
-      priority: entry.priority
-    }
-  end
-
-  defp observed_payload(%{issues: issues, observed_at: observed_at}) when is_list(issues) do
-    now = DateTime.utc_now()
-
-    %{
-      observed_at: iso8601(observed_at),
-      issues: Enum.map(issues, &observed_issue_payload(&1, now))
-    }
-  end
-
-  defp observed_payload(_observed), do: %{observed_at: nil, issues: []}
-
-  defp observed_issue_payload(issue, now) do
-    %{
-      issue_id: issue.id,
-      identifier: issue.identifier,
-      state: issue.state,
-      url: issue.url,
-      updated_at: iso8601(issue.updated_at),
-      age_seconds: age_seconds(issue.updated_at, now)
-    }
-  end
-
-  defp age_seconds(%DateTime{} = updated_at, %DateTime{} = now),
-    do: max(DateTime.diff(now, updated_at, :second), 0)
-
-  defp age_seconds(_updated_at, _now), do: nil
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do
     %{
