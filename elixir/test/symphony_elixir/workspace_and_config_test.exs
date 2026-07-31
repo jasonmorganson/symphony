@@ -1668,4 +1668,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+  test "linear client recognizes atom-keyed Linear rate-limit wrappers" do
+    rate_limit_name = Module.concat(__MODULE__, :AtomKeyedLinearRateLimit)
+    start_supervised!({SymphonyElixir.Linear.RateLimit, name: rate_limit_name})
+
+    assert {:error, {:linear_rate_limited, _}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    body: %{errors: [%{extensions: %{code: "RATELIMITED", statusCode: 429}}]}
+                  }}
+               end
+             )
+  end
 end

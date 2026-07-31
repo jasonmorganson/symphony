@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.RateLimit
   alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
@@ -141,6 +142,12 @@ defmodule SymphonyElixir.Linear.Client do
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
     tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
+    rate_limit_server = Keyword.get(opts, :rate_limit_server, RateLimit)
+
+    request_interval_ms =
+      Keyword.get_lazy(opts, :request_interval_ms, fn ->
+        configured_request_interval_ms()
+      end)
 
     request_fun =
       Keyword.get(opts, :request_fun, fn request_payload, headers ->
@@ -148,21 +155,27 @@ defmodule SymphonyElixir.Linear.Client do
       end)
 
     with {:ok, headers} <- graphql_headers(tracker_settings),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
-      {:ok, body}
+         :ok <- RateLimit.acquire(request_interval_ms, rate_limit_server) do
+      case request_fun.(payload, headers) do
+        {:ok, %{status: 200, body: body}} ->
+          {:ok, body}
+
+        {:ok, response} ->
+          handle_error_response(payload, response, rate_limit_server)
+
+        {:error, reason} ->
+          Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
+          {:error, {:linear_api_request, reason}}
+      end
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
-        )
-
-        {:error, {:linear_api_status, response.status}}
-
-      {:error, reason} ->
-        Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
-        {:error, {:linear_api_request, reason}}
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp configured_request_interval_ms do
+    Config.settings!().polling.request_interval_ms
+  rescue
+    ArgumentError -> 1_500
   end
 
   @doc false
@@ -332,6 +345,101 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp maybe_put_operation_name(payload, _operation_name), do: payload
+
+  defp handle_error_response(payload, response, rate_limit_server) do
+    case rate_limit_retry_after_ms(response) do
+      {:ok, retry_after_ms} ->
+        :ok = RateLimit.activate(retry_after_ms, rate_limit_server)
+
+        Logger.warning(
+          "Linear GraphQL rate limited retry_after_ms=#{retry_after_ms}" <>
+            linear_error_context(payload, response)
+        )
+
+        {:error, {:linear_rate_limited, retry_after_ms}}
+
+      :error ->
+        Logger.error(
+          "Linear GraphQL request failed status=#{response.status}" <>
+            linear_error_context(payload, response)
+        )
+
+        {:error, {:linear_api_status, response.status}}
+    end
+  end
+
+  defp rate_limit_retry_after_ms(%{status: status} = response) do
+    if status == 429 or rate_limited_body?(Map.get(response, :body)) do
+      {:ok, retry_after_header_ms(response) || default_rate_limit_cooldown_ms()}
+    else
+      :error
+    end
+  end
+
+  defp rate_limit_retry_after_ms(_response), do: :error
+
+  defp rate_limited_body?(body) when is_map(body) do
+    errors = Map.get(body, "errors") || Map.get(body, :errors)
+
+    is_list(errors) and
+      Enum.any?(errors, fn error ->
+        extensions = Map.get(error, "extensions") || Map.get(error, :extensions)
+
+        is_map(extensions) and
+          ((Map.get(extensions, "code") || Map.get(extensions, :code)) == "RATELIMITED" or
+             (Map.get(extensions, "statusCode") || Map.get(extensions, :statusCode)) == 429)
+      end)
+  end
+
+  defp rate_limited_body?(_body), do: false
+
+  defp retry_after_header_ms(%Req.Response{} = response) do
+    response
+    |> Req.Response.get_header("retry-after")
+    |> List.first()
+    |> parse_retry_after_ms()
+  end
+
+  defp retry_after_header_ms(%{headers: headers}) do
+    headers
+    |> header_value("retry-after")
+    |> parse_retry_after_ms()
+  end
+
+  defp retry_after_header_ms(_response), do: nil
+
+  defp header_value(headers, name) when is_map(headers) do
+    case Map.get(headers, name) || Map.get(headers, String.downcase(name)) do
+      [value | _] when is_binary(value) -> value
+      value when is_binary(value) -> value
+      _ -> nil
+    end
+  end
+
+  defp header_value(headers, name) when is_list(headers) do
+    Enum.find_value(headers, fn
+      {header_name, value} when is_binary(header_name) and is_binary(value) ->
+        if String.downcase(header_name) == name, do: value
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp header_value(_headers, _name), do: nil
+
+  defp parse_retry_after_ms(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {seconds, ""} when seconds >= 0 -> seconds * 1_000
+      _ -> nil
+    end
+  end
+
+  defp parse_retry_after_ms(_value), do: nil
+
+  defp default_rate_limit_cooldown_ms do
+    max(Config.settings!().polling.interval_ms, 15_000)
+  end
 
   defp linear_error_context(payload, response) when is_map(payload) do
     operation_name =
