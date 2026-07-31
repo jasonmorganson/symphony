@@ -1537,6 +1537,45 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == :no_worker_capacity
   end
 
+  test "merging work can transfer its affinity when its durable host is busy" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    affinity_path =
+      Path.join(System.tmp_dir!(), "affinity-transfer-#{System.unique_integer([:positive])}.json")
+
+    on_exit(fn -> File.rm(affinity_path) end)
+
+    state = %Orchestrator.State{
+      affinity_state_path: affinity_path,
+      configured_worker_hosts: ["worker-a", "worker-b"],
+      worker_affinities: %{"merging" => "worker-a"},
+      running: %{"other" => %{worker_host: "worker-a"}}
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "merging", true) ==
+             "worker-b"
+
+    assert {:ok, reassigned} =
+             Orchestrator.persist_issue_affinity_for_test(state, "merging", "worker-b", true)
+
+    assert reassigned.worker_affinities["merging"] == "worker-b"
+
+    assert {:ok, %{"merging" => "worker-b"}} =
+             SymphonyElixir.WorkerAffinityStore.load(
+               affinity_path,
+               ["worker-a", "worker-b"]
+             )
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "editing", false) ==
+             :no_worker_capacity
+
+    assert {:error, {:worker_affinity_conflict, "worker-a"}} =
+             Orchestrator.persist_issue_affinity_for_test(state, "merging", "worker-b", false)
+  end
+
   test "select_worker_host_for_test reserves a durable host for an imminent retry" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],
