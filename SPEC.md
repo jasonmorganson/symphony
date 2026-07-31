@@ -669,18 +669,9 @@ Important nuance:
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
-- The coding agent MAY report a built-in `defer` scheduling hint when another immediate turn would
-  only repeat completed work or wait on external evidence.
-- A scheduling hint MUST NOT change tracker state or encode a requested tracker state. Missing,
-  malformed, or unsupported hints MUST preserve immediate continuation behavior.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session. A valid `defer` hint instead schedules a bounded authoritative tracker recheck after
-  about 4 minutes. Consecutive deferrals whose tracker state is unchanged and whose `updated_at`
-  has not advanced between worker turns MUST back off exponentially to a one-hour cap, except that
-  `Merging` MUST retain the four-minute reconciliation cadence. Tracker updates made during the
-  worker's own turn establish the next baseline; a state change or timestamp advance between turns
-  MUST reset the defer streak.
+  session.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -713,9 +704,6 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
     turn loop.
-  - Use the short continuation delay by default. Use the bounded deferred delay only when the
-    worker reported a valid built-in `defer` scheduling hint before exit. Progressively back off
-    unchanged non-`Merging` deferrals, while keeping `Merging` on the bounded initial delay.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -1413,10 +1401,6 @@ SHOULD return:
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
-- Implementations that expose external worker-pool control MAY also include:
-  - `demand.eligible` and `demand.observed_at`, derived from the latest tracker poll
-  - configured, drained, and available worker hosts
-  - currently available worker-session slots
 
 RECOMMENDED snapshot error modes:
 
@@ -1517,8 +1501,6 @@ Minimum endpoints:
 - `GET /api/v1/state`
   - Returns a summary view of the current system state (running sessions, retry queue/delays,
     aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
-  - Implementations with an external worker pool MAY include the demand and worker-pool fields from
-    Section 13.3 without requiring another tracker request.
   - Suggested response shape:
 
     ```json
@@ -1998,10 +1980,6 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     if issue.state is not active or not issue_routable(issue):
       break
 
-    if turn_result.scheduling_hint == defer:
-      send(orchestrator_channel, {agent_run_outcome, issue.id, defer})
-      break
-
     if turn_number >= max_turns:
       break
 
@@ -2024,10 +2002,7 @@ on_worker_exit(issue_id, reason, state):
     state.completed.add(issue_id)  # bookkeeping only
     state = schedule_retry(state, issue_id, 1, {
       identifier: running_entry.identifier,
-      delay_type:
-        if running_entry.completion.outcome == defer
-        then deferred_continuation
-        else continuation
+      delay_type: continuation
     })
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
@@ -2284,12 +2259,6 @@ Extension config:
   - When omitted, work runs locally.
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
   - Shared per-host cap applied across configured SSH hosts.
-- `worker.drain_state_path` (path string, OPTIONAL)
-  - Durable exact set of SSH hosts excluded from new dispatches.
-- `worker.affinity_state_path` (path string, OPTIONAL)
-  - Durable issue-to-host assignments for remote workspaces.
-- `worker.affinity_seed_path` (path string, OPTIONAL)
-  - Prevalidated one-time initial assignments, used only when durable affinity state is absent.
 
 ### A.1 Execution Model
 
@@ -2301,8 +2270,7 @@ Extension config:
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
 - The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
   orchestrator still owns the session lifecycle even though commands execute remotely.
-- Continuation turns and retries MUST stay on the durable assigned host when
-  `worker.affinity_state_path` is configured.
+- Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
 - A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
   shell, writable workspace root, coding-agent executable, and any required auth or repository
   prerequisites.
@@ -2310,25 +2278,14 @@ Extension config:
 ### A.2 Scheduling Notes
 
 - SSH hosts MAY be treated as a pool for dispatch.
-- Implementations with durable affinity MUST select the recorded host on startup, continuation,
-  retry, and stalled-session recovery.
-- A host MUST NOT receive a new durable affinity while another issue owns it. If legacy durable
-  state names multiple issues for one host, the orchestrator MUST elect exactly one owner
-  (preserving a running owner first, then the earliest retry), surface the other issue as pending,
-  and treat reassignment to an unowned host as an explicit new attempt.
+- Implementations MAY prefer the previously used host on retries when that host is still
+  available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
-- Drained hosts MUST remain ineligible for new dispatches, while active sessions already assigned
-  to a newly drained host continue under the normal session lifecycle.
-- An implementation exposing remote drain control SHOULD replace the complete durable drain set
-  atomically, validate hosts against `worker.ssh_hosts`, and authenticate mutation requests.
-- Drain acknowledgements that report active drained hosts MUST include running sessions, not
-  deferred retry timers. A deferred retry retains its durable host affinity and waits for that host
-  to become available before dispatch.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
-- An implementation with durable affinity MUST wait when the recorded host is unavailable; it
-  MUST NOT silently select another host whose workspace may be stale.
+- Implementations MAY fail over to another host when the original host is unavailable before work
+  has meaningfully started.
 - Once a run has already produced side effects, a transparent rerun on another host SHOULD be
   treated as a new attempt, not as invisible failover.
 

@@ -5,7 +5,6 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -101,79 +100,46 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
-    :ok = DynamicTool.reset_turn_outcome()
 
-    case AppServer.run_turn(
-           app_session,
-           prompt,
-           issue,
-           on_message: codex_message_handler(codex_update_recipient, issue)
-         ) do
-      {:ok, turn_session} ->
-        Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
-        turn_outcome = take_turn_outcome(opts)
+    with {:ok, turn_session} <-
+           AppServer.run_turn(
+             app_session,
+             prompt,
+             issue,
+             on_message: codex_message_handler(codex_update_recipient, issue)
+           ) do
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-        case continue_with_issue?(issue, issue_state_fetcher) do
-          {:continue, refreshed_issue} when turn_outcome.outcome == :defer ->
-            Logger.info("Deferring agent continuation for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case continue_with_issue?(issue, issue_state_fetcher) do
+        {:continue, refreshed_issue} when turn_number < max_turns ->
+          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-            send_agent_run_outcome(
-              codex_update_recipient,
-              refreshed_issue,
-              Map.merge(turn_outcome, %{
-                issue_state: refreshed_issue.state,
-                observed_before_updated_at: issue.updated_at,
-                observed_after_updated_at: refreshed_issue.updated_at
-              })
-            )
+          do_run_codex_turns(
+            app_session,
+            workspace,
+            refreshed_issue,
+            codex_update_recipient,
+            opts,
+            issue_state_fetcher,
+            turn_number + 1,
+            max_turns
+          )
 
-            :ok
+        {:continue, refreshed_issue} ->
+          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          {:continue, refreshed_issue} when turn_number < max_turns ->
-            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+          :ok
 
-            do_run_codex_turns(
-              app_session,
-              workspace,
-              refreshed_issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              turn_number + 1,
-              max_turns
-            )
+        {:done, _refreshed_issue} ->
+          :ok
 
-          {:continue, refreshed_issue} ->
-            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-            :ok
-
-          {:done, _refreshed_issue} ->
-            :ok
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:error, {:port_exit, 0}} ->
-        Logger.warning("Codex app-server exited cleanly before turn completion for #{issue_context(issue)} turn=#{turn_number}/#{max_turns}; scheduling immediate active-state continuation")
-
-        send_agent_run_outcome(
-          codex_update_recipient,
-          issue,
-          %{outcome: :continue, reason: :clean_incomplete_exit}
-        )
-
-        :ok
-
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    PromptBuilder.build_prompt(issue, opts) <> turn_outcome_guidance()
-  end
+  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -184,40 +150,8 @@ defmodule SymphonyElixir.AgentRunner do
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-    """ <> turn_outcome_guidance()
-  end
-
-  defp turn_outcome_guidance do
-    """
-
-    Turn scheduling:
-
-    - Immediate continuation is the safe default; no report is required for it.
-    - If another immediate turn would only repeat completed work or wait on external evidence, call `symphony_report_turn_outcome` with outcome `defer` as your final tool action.
-    - `defer` only delays Symphony's next authoritative tracker recheck. It does not change tracker state and must not be used to claim a tracker transition.
     """
   end
-
-  defp take_turn_outcome(opts) do
-    fetcher = Keyword.get(opts, :turn_outcome_fetcher, &DynamicTool.take_turn_outcome/0)
-
-    case fetcher.() do
-      %{outcome: outcome} = reported when outcome in [:continue, :defer] ->
-        %{outcome: outcome, reason: Map.get(reported, :reason)}
-
-      _ ->
-        %{outcome: :continue, reason: nil}
-    end
-  end
-
-  defp send_agent_run_outcome(recipient, %Issue{id: issue_id}, outcome)
-       when is_pid(recipient) and is_binary(issue_id) do
-    send(recipient, {:agent_run_outcome, issue_id, outcome})
-
-    :ok
-  end
-
-  defp send_agent_run_outcome(_recipient, _issue, _outcome), do: :ok
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

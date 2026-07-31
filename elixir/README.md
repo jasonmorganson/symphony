@@ -149,16 +149,6 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
-- `tracker.recovery_issue_ids` is an optional operator-controlled escape hatch
-  for work that was moved out of the configured active states by an external
-  scheduler or review lock. Only the listed issue IDs or identifiers are
-  fetched and admitted; ordinary backlog work remains ineligible. Remove an
-  entry after the workflow restores the issue to an active state.
-  Recovery entries remain part of polled demand while capacity is exhausted, so a restart cannot
-  make configured stranded work disappear merely because every worker is reserved.
-- `polling.request_interval_ms` spaces the starts of all Linear GraphQL
-  requests across poll, retry, and tool paths. It defaults to `1500`; set it to
-  `0` only when another shared limiter provides equivalent pacing.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -175,15 +165,6 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
-- Symphony advertises a built-in `symphony_report_turn_outcome` tool. Immediate continuation is the
-  fail-open default. An agent may report `defer` when another immediate turn would only repeat
-  completed work or wait on external evidence; Symphony then performs its next authoritative
-  tracker recheck after about four minutes. Consecutive unchanged non-`Merging` deferrals back off
-  exponentially to a one-hour cap and reset when tracker state changes or `updated_at` advances
-  between deferred turns. Updates made during the worker's own turn become the next baseline and
-  do not masquerade as external progress. `Merging` reconciliation remains on the four-minute
-  cadence. This is only a scheduling hint: it never changes tracker state and it does not accept
-  tracker state names.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -218,38 +199,6 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
-- `worker.drain_state_path` enables exact durable worker drains. When configured, a missing or
-  invalid drain file fails closed by draining every configured worker until an authenticated
-  replacement succeeds.
-- `worker.affinity_state_path` atomically records the SSH host that owns each issue workspace.
-  When configured, Symphony refuses to start from corrupt affinity state and waits for an assigned
-  host instead of dispatching the issue to a different worker after a restart. New assignments are
-  exclusive per host. If legacy state contains duplicate owners, a running session wins; otherwise
-  the earliest retry wins and the loser starts a visible new attempt on an unowned host.
-- `worker.affinity_seed_path` optionally provides a prevalidated one-time migration seed. Symphony
-  reads and atomically promotes it only when the durable affinity registry does not yet exist.
-
-### Kubernetes autoscaling extensions
-
-This fork keeps upstream orchestration and adds a small authenticated surface for an external
-Kubernetes controller:
-
-- `GET /api/v1/state` includes cached `demand.eligible`, `demand.dependency_blocked`,
-  `demand.observed_at`, individually identified `pending` issues, worker affinity entries, and
-  `worker_pool` counts.
-  `dependency_blocked` identifies active Todo issues waiting on nonterminal tracker blockers
-  without making them dispatchable. `worker_pool.required_hosts` lets an external autoscaler keep
-  every durable workspace owner available. Demand and blocker visibility are calculated from the
-  candidate list already fetched by the normal poll.
-- `PUT /api/v1/worker-drains` replaces the exact durable drain set. It requires
-  `Authorization: Bearer <SYMPHONY_WORKER_DRAIN_TOKEN>` with a token of at least 32 bytes and
-  returns configured, drained, and still-active drained hosts.
-- Drained hosts are excluded from normal worker selection. No state, including `Merging`, receives
-  a fork-specific concurrency limit.
-- Linear requests are proactively spaced by `polling.request_interval_ms`.
-  HTTP 429 responses and GraphQL `RATELIMITED` errors also activate one shared
-  cooldown, so concurrent poll, retry, and tool paths do not amplify provider
-  throttling.
 
 ### Linear adapter profile
 
