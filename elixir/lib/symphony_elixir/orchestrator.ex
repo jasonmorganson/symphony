@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
+  @capacity_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -399,6 +400,18 @@ defmodule SymphonyElixir.Orchestrator do
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
+  end
+
+  @doc false
+  @spec new_issue_slots_available_for_test(term()) :: boolean()
+  def new_issue_slots_available_for_test(%State{} = state) do
+    new_issue_slots_available?(state)
+  end
+
+  @doc false
+  @spec retry_delay_for_test(pos_integer(), map()) :: non_neg_integer()
+  def retry_delay_for_test(attempt, metadata) do
+    retry_delay(attempt, metadata)
   end
 
   @doc false
@@ -823,12 +836,16 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
-      available_slots(state) > 0 and
+      new_issue_slots_available?(state) and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp new_issue_slots_available?(%State{} = state) do
+    available_slots(state) > map_size(state.retry_attempts)
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -1221,9 +1238,10 @@ defmodule SymphonyElixir.Orchestrator do
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
+           delay_type: :capacity,
            error: "no available orchestrator slots"
          })
        )}
@@ -1240,10 +1258,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    case metadata[:delay_type] do
+      :capacity -> @capacity_retry_delay_ms
+      :continuation when attempt == 1 -> @continuation_retry_delay_ms
+      _ -> failure_retry_delay(attempt)
     end
   end
 
