@@ -613,6 +613,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec select_worker_host_for_test(term(), String.t() | nil, String.t() | nil, boolean()) ::
+          String.t() | nil | :no_worker_capacity
+  def select_worker_host_for_test(%State{} = state, preferred_worker_host, issue_id, reassign?) do
+    select_worker_host(state, preferred_worker_host, issue_id, reassign?)
+  end
+
+  @doc false
+  @spec persist_issue_affinity_for_test(term(), String.t(), String.t(), boolean()) ::
+          {:ok, term()} | {:error, term()}
+  def persist_issue_affinity_for_test(%State{} = state, issue_id, worker_host, reassign?) do
+    persist_issue_affinity(state, issue_id, worker_host, reassign?)
+  end
+
+  @doc false
   @spec wake_capacity_blocked_retries_for_test(term(), MapSet.t(), MapSet.t()) :: term()
   def wake_capacity_blocked_retries_for_test(
         %State{} = state,
@@ -1344,14 +1358,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
+    reassign? = normalize_issue_state(issue.state) == "merging"
 
-    case select_worker_host(state, preferred_worker_host, issue.id) do
+    case select_worker_host(state, preferred_worker_host, issue.id, reassign?) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        case persist_issue_affinity(state, issue.id, worker_host) do
+        case persist_issue_affinity(state, issue.id, worker_host, reassign?) do
           {:ok, state} ->
             spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
 
@@ -1720,19 +1735,19 @@ defmodule SymphonyElixir.Orchestrator do
     Map.put(running_entry, key, value)
   end
 
-  defp select_worker_host(%State{} = state, preferred_worker_host, issue_id \\ nil) do
+  defp select_worker_host(%State{} = state, preferred_worker_host, issue_id \\ nil, reassign? \\ false) do
     configured_hosts =
       case state.configured_worker_hosts do
         [] -> Config.settings!().worker.ssh_hosts
         hosts -> hosts
       end
 
-    select_configured_worker_host(state, configured_hosts, preferred_worker_host, issue_id)
+    select_configured_worker_host(state, configured_hosts, preferred_worker_host, issue_id, reassign?)
   end
 
-  defp select_configured_worker_host(_state, [], _preferred_worker_host, _issue_id), do: nil
+  defp select_configured_worker_host(_state, [], _preferred_worker_host, _issue_id, _reassign?), do: nil
 
-  defp select_configured_worker_host(state, hosts, preferred_worker_host, issue_id) do
+  defp select_configured_worker_host(state, hosts, preferred_worker_host, issue_id, reassign?) do
     available_hosts =
       Enum.filter(hosts, fn host ->
         !MapSet.member?(state.drained_worker_hosts, host) and
@@ -1744,18 +1759,25 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host_reserved_for_other_retry?(state, host, issue_id)
       end)
 
-    choose_available_worker_host(state, selectable_hosts, preferred_worker_host)
+    choose_available_worker_host(state, selectable_hosts, preferred_worker_host, reassign?)
   end
 
-  defp choose_available_worker_host(_state, [], _preferred_worker_host),
+  defp choose_available_worker_host(_state, [], _preferred_worker_host, _reassign?),
     do: :no_worker_capacity
 
-  defp choose_available_worker_host(_state, hosts, preferred_worker_host)
+  defp choose_available_worker_host(_state, hosts, preferred_worker_host, false)
        when is_binary(preferred_worker_host) and preferred_worker_host != "" do
     if preferred_worker_host in hosts, do: preferred_worker_host, else: :no_worker_capacity
   end
 
-  defp choose_available_worker_host(state, hosts, _preferred_worker_host) do
+  defp choose_available_worker_host(state, hosts, preferred_worker_host, true)
+       when is_binary(preferred_worker_host) and preferred_worker_host != "" do
+    if preferred_worker_host in hosts,
+      do: preferred_worker_host,
+      else: least_loaded_worker_host(state, hosts)
+  end
+
+  defp choose_available_worker_host(state, hosts, _preferred_worker_host, _reassign?) do
     least_loaded_worker_host(state, hosts)
   end
 
@@ -2388,17 +2410,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp affinity_host(_state, _issue_id), do: nil
 
-  defp persist_issue_affinity(%State{} = state, _issue_id, nil), do: {:ok, state}
+  defp persist_issue_affinity(%State{} = state, _issue_id, nil, _reassign?), do: {:ok, state}
 
-  defp persist_issue_affinity(%State{} = state, issue_id, worker_host) do
+  defp persist_issue_affinity(%State{} = state, issue_id, worker_host, reassign?) do
     case Map.fetch(state.worker_affinities, issue_id) do
       {:ok, ^worker_host} ->
         {:ok, state}
 
-      {:ok, other_host} ->
+      {:ok, other_host} when not reassign? ->
         {:error, {:worker_affinity_conflict, other_host}}
 
-      :error ->
+      _existing_or_missing ->
         case WorkerAffinityStore.put(
                state.affinity_state_path,
                state.worker_affinities,
