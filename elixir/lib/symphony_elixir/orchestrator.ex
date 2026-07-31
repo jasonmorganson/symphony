@@ -69,7 +69,7 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
+        start_terminal_workspace_cleanup(state.task_supervisor)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -1171,6 +1171,16 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+    end
+  end
+
+  defp start_terminal_workspace_cleanup(task_supervisor) do
+    case Task.Supervisor.start_child(task_supervisor, &run_terminal_workspace_cleanup/0) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Skipping startup terminal workspace cleanup; failed to start task: #{inspect(reason)}")
     end
   end
 
