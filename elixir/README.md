@@ -154,6 +154,8 @@ Notes:
   scheduler or review lock. Only the listed issue IDs or identifiers are
   fetched and admitted; ordinary backlog work remains ineligible. Remove an
   entry after the workflow restores the issue to an active state.
+  Recovery entries remain part of polled demand while capacity is exhausted, so a restart cannot
+  make configured stranded work disappear merely because every worker is reserved.
 - `polling.request_interval_ms` spaces the starts of all Linear GraphQL
   requests across poll, retry, and tool paths. It defaults to `1500`; set it to
   `0` only when another shared limiter provides equivalent pacing.
@@ -221,7 +223,9 @@ codex:
   replacement succeeds.
 - `worker.affinity_state_path` atomically records the SSH host that owns each issue workspace.
   When configured, Symphony refuses to start from corrupt affinity state and waits for an assigned
-  host instead of dispatching the issue to a different worker after a restart.
+  host instead of dispatching the issue to a different worker after a restart. New assignments are
+  exclusive per host. If legacy state contains duplicate owners, a running session wins; otherwise
+  the earliest retry wins and the loser starts a visible new attempt on an unowned host.
 - `worker.affinity_seed_path` optionally provides a prevalidated one-time migration seed. Symphony
   reads and atomically promotes it only when the durable affinity registry does not yet exist.
 
@@ -231,7 +235,8 @@ This fork keeps upstream orchestration and adds a small authenticated surface fo
 Kubernetes controller:
 
 - `GET /api/v1/state` includes cached `demand.eligible`, `demand.dependency_blocked`,
-  `demand.observed_at`, worker affinity entries, and `worker_pool` counts.
+  `demand.observed_at`, individually identified `pending` issues, worker affinity entries, and
+  `worker_pool` counts.
   `dependency_blocked` identifies active Todo issues waiting on nonterminal tracker blockers
   without making them dispatchable. `worker_pool.required_hosts` lets an external autoscaler keep
   every durable workspace owner available. Demand and blocker visibility are calculated from the

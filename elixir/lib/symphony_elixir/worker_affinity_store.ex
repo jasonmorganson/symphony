@@ -30,9 +30,9 @@ defmodule SymphonyElixir.WorkerAffinityStore do
           {:ok, map()} | {:error, term()}
   def put(path, affinities, issue_id, worker_host, configured_hosts)
       when is_map(affinities) and is_binary(issue_id) and is_binary(worker_host) do
-    updated = Map.put(affinities, issue_id, worker_host)
-
-    with :ok <- validate(updated, configured_hosts),
+    with :ok <- validate_host_owner(affinities, issue_id, worker_host),
+         updated = Map.put(affinities, issue_id, worker_host),
+         :ok <- validate(updated, configured_hosts),
          :ok <- persist(path, updated) do
       {:ok, updated}
     end
@@ -104,6 +104,15 @@ defmodule SymphonyElixir.WorkerAffinityStore do
       :ok
     else
       {:error, :invalid_affinity_state}
+    end
+  end
+
+  defp validate_host_owner(affinities, issue_id, worker_host) do
+    case Enum.find(affinities, fn {other_issue_id, host} ->
+           other_issue_id != issue_id and host == worker_host
+         end) do
+      nil -> :ok
+      {other_issue_id, _host} -> {:error, {:worker_affinity_owned, worker_host, other_issue_id}}
     end
   end
 end

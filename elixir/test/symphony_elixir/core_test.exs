@@ -1576,6 +1576,107 @@ defmodule SymphonyElixir.CoreTest do
              Orchestrator.persist_issue_affinity_for_test(state, "merging", "worker-b", false)
   end
 
+  test "shared durable affinity elects one retry owner and safely reassigns the loser" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    affinity_path =
+      Path.join(System.tmp_dir!(), "affinity-collision-#{System.unique_integer([:positive])}.json")
+
+    on_exit(fn -> File.rm(affinity_path) end)
+    now_ms = System.monotonic_time(:millisecond)
+
+    state = %Orchestrator.State{
+      affinity_state_path: affinity_path,
+      configured_worker_hosts: ["worker-a", "worker-b"],
+      worker_affinities: %{"earlier" => "worker-a", "later" => "worker-a"},
+      retry_attempts: %{
+        "earlier" => %{worker_host: "worker-a", due_at_ms: now_ms + 10_000},
+        "later" => %{worker_host: "worker-a", due_at_ms: now_ms + 20_000}
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "earlier", false) ==
+             "worker-a"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "later", true) ==
+             "worker-b"
+
+    assert {:ok, reassigned} =
+             Orchestrator.persist_issue_affinity_for_test(state, "later", "worker-b", true)
+
+    assert reassigned.worker_affinities == %{
+             "earlier" => "worker-a",
+             "later" => "worker-b"
+           }
+  end
+
+  test "running affinity owner wins a collision without overlapping another session" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    state = %Orchestrator.State{
+      worker_affinities: %{"running" => "worker-a", "retrying" => "worker-a"},
+      running: %{"running" => %{worker_host: "worker-a"}},
+      retry_attempts: %{
+        "retrying" => %{
+          worker_host: "worker-a",
+          due_at_ms: System.monotonic_time(:millisecond)
+        }
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "retrying", true) ==
+             "worker-b"
+  end
+
+  test "restart recovery remains discoverable when durable affinity exists" do
+    state = %Orchestrator.State{
+      worker_affinities: %{"recovery-id" => "worker-a"},
+      claimed: MapSet.new(),
+      running: %{},
+      retry_attempts: %{},
+      blocked: %{}
+    }
+
+    assert Orchestrator.pending_recovery_issue_ids_for_test(["recovery-id"], state) == [
+             "recovery-id"
+           ]
+  end
+
+  test "eligible work without a running retry or blocker is visible as pending" do
+    issue = %Issue{
+      id: "pending-id",
+      identifier: "MT-700",
+      title: "Visible pending work",
+      state: "Todo",
+      dispatchable: true,
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new(["pending-id"]),
+      running: %{},
+      retry_attempts: %{},
+      blocked: %{}
+    }
+
+    assert [%Issue{id: "pending-id", identifier: "MT-700"}] =
+             Orchestrator.pending_issues_from_issues_for_test([issue], state)
+
+    retrying_state =
+      put_in(state.retry_attempts["pending-id"], %{
+        due_at_ms: System.monotonic_time(:millisecond),
+        attempt: 1
+      })
+
+    assert Orchestrator.pending_issues_from_issues_for_test([issue], retrying_state) == []
+  end
+
   test "select_worker_host_for_test reserves a durable host for an imminent retry" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],

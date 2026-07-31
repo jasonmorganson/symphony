@@ -60,6 +60,7 @@ defmodule SymphonyElixir.Orchestrator do
       demand_eligible: 0,
       demand_dependency_blocked: 0,
       demand_observed_at: nil,
+      eligible_pending_issues: [],
       dependency_blocked_issues: [],
       observed_issues: [],
       observed_issues_observed_at: nil,
@@ -266,7 +267,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
+      case retry_attempt_state(state, issue_id, retry_token) do
         {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
         :missing -> {:noreply, state}
       end
@@ -652,6 +653,12 @@ defmodule SymphonyElixir.Orchestrator do
       dependency_blocked: state.demand_dependency_blocked,
       observed_at: state.demand_observed_at
     }
+  end
+
+  @doc false
+  @spec pending_issues_from_issues_for_test([Issue.t()], term()) :: [Issue.t()]
+  def pending_issues_from_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    observe_demand(state, issues).eligible_pending_issues
   end
 
   @doc false
@@ -1077,14 +1084,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp fetch_pending_recovery_issues(config, state) do
-    pending_ids =
-      if available_slots(state) > 0 and worker_slots_available?(state) do
-        pending_recovery_issue_ids(config.tracker.recovery_issue_ids, state)
-      else
-        []
-      end
-
-    Tracker.fetch_issues_by_ids(pending_ids)
+    config.tracker.recovery_issue_ids
+    |> pending_recovery_issue_ids(state)
+    |> Tracker.fetch_issues_by_ids()
   end
 
   defp pending_recovery_issue_ids(configured_ids, state) do
@@ -1147,7 +1149,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      worker_slots_available_for_issue?(state, issue)
   end
 
   defp should_dispatch_issue?(
@@ -1232,11 +1234,26 @@ defmodule SymphonyElixir.Orchestrator do
           false
       end)
 
+    pending_issues =
+      issues
+      |> Enum.filter(fn
+        %Issue{} = issue ->
+          candidate_issue?(issue, active_states, terminal_states, required_labels) and
+            !Map.has_key?(state.running, issue.id) and
+            !Map.has_key?(state.retry_attempts, issue.id) and
+            !Map.has_key?(state.blocked, issue.id)
+
+        _ ->
+          false
+      end)
+      |> sort_issues_for_dispatch()
+
     %{
       state
       | demand_eligible: eligible,
         demand_dependency_blocked: Enum.count(issues, &dependency_blocked_issue?/1),
-        demand_observed_at: DateTime.utc_now()
+        demand_observed_at: DateTime.utc_now(),
+        eligible_pending_issues: pending_issues
     }
   end
 
@@ -1358,7 +1375,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
-    reassign? = normalize_issue_state(issue.state) == "merging"
+    collision_reassignment? = affinity_collision_loser?(state, issue.id)
+
+    reassign? =
+      normalize_issue_state(issue.state) == "merging" or
+        collision_reassignment?
+
+    if collision_reassignment? do
+      Logger.warning("Repairing duplicate worker affinity for #{issue_context(issue)} previous_worker_host=#{inspect(preferred_worker_host)}; dispatching a new attempt on an exclusively owned host")
+    end
 
     case select_worker_host(state, preferred_worker_host, issue.id, reassign?) do
       :no_worker_capacity ->
@@ -1506,7 +1531,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
+  defp retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
@@ -1517,7 +1542,7 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
 
-        {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
+        {:ok, attempt, metadata, state}
 
       _ ->
         :missing
@@ -1619,7 +1644,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host], issue.id) do
+         worker_slots_available_for_issue?(state, issue, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
@@ -1756,7 +1781,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     selectable_hosts =
       Enum.reject(available_hosts, fn host ->
-        worker_host_reserved_for_other_retry?(state, host, issue_id)
+        worker_host_reserved_for_other_retry?(state, host, issue_id) or
+          worker_host_owned_by_other_issue?(state, host, issue_id)
       end)
 
     choose_available_worker_host(state, selectable_hosts, preferred_worker_host, reassign?)
@@ -1797,12 +1823,20 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp worker_slots_available?(%State{} = state) do
-    select_worker_host(state, nil) != :no_worker_capacity
+  defp worker_slots_available_for_issue?(%State{} = state, %Issue{} = issue) do
+    worker_slots_available_for_issue?(state, issue, affinity_host(state, issue.id))
   end
 
-  defp worker_slots_available?(%State{} = state, preferred_worker_host, issue_id) do
-    select_worker_host(state, preferred_worker_host, issue_id) != :no_worker_capacity
+  defp worker_slots_available_for_issue?(
+         %State{} = state,
+         %Issue{} = issue,
+         preferred_worker_host
+       ) do
+    reassign? =
+      normalize_issue_state(issue.state) == "merging" or
+        affinity_collision_loser?(state, issue.id)
+
+    select_worker_host(state, preferred_worker_host, issue.id, reassign?) != :no_worker_capacity
   end
 
   defp worker_host_slots_available?(%State{} = state, worker_host) when is_binary(worker_host) do
@@ -1850,6 +1884,57 @@ defmodule SymphonyElixir.Orchestrator do
     |> case do
       nil -> nil
       {retry_issue_id, _retry} -> retry_issue_id
+    end
+  end
+
+  defp worker_host_owned_by_other_issue?(%State{} = state, worker_host, issue_id)
+       when is_binary(worker_host) do
+    case worker_host_affinity_owner(state, worker_host) do
+      nil -> false
+      ^issue_id when is_binary(issue_id) -> false
+      _other_issue_id -> true
+    end
+  end
+
+  defp affinity_collision_loser?(%State{} = state, issue_id) when is_binary(issue_id) do
+    case affinity_host(state, issue_id) do
+      worker_host when is_binary(worker_host) ->
+        worker_host_affinity_owner(state, worker_host) != issue_id
+
+      _ ->
+        false
+    end
+  end
+
+  defp worker_host_affinity_owner(%State{} = state, worker_host) when is_binary(worker_host) do
+    issue_ids =
+      state.worker_affinities
+      |> Enum.flat_map(fn
+        {issue_id, ^worker_host} -> [issue_id]
+        _ -> []
+      end)
+
+    running_owner =
+      issue_ids
+      |> Enum.filter(&Map.has_key?(state.running, &1))
+      |> Enum.sort()
+      |> List.first()
+
+    running_owner || retry_affinity_owner(state, issue_ids) || Enum.min(issue_ids, fn -> nil end)
+  end
+
+  defp retry_affinity_owner(%State{} = state, issue_ids) do
+    issue_ids
+    |> Enum.flat_map(fn issue_id ->
+      case Map.get(state.retry_attempts, issue_id) do
+        %{due_at_ms: due_at_ms} when is_integer(due_at_ms) -> [{due_at_ms, issue_id}]
+        _ -> []
+      end
+    end)
+    |> Enum.min(fn -> nil end)
+    |> case do
+      nil -> nil
+      {_due_at_ms, issue_id} -> issue_id
     end
   end
 
@@ -2019,6 +2104,24 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(fn {issue_id, worker_host} -> %{issue_id: issue_id, worker_host: worker_host} end)
       |> Enum.sort_by(& &1.issue_id)
 
+    pending =
+      state.eligible_pending_issues
+      |> Enum.reject(fn issue ->
+        Map.has_key?(state.running, issue.id) or
+          Map.has_key?(state.retry_attempts, issue.id) or
+          Map.has_key?(state.blocked, issue.id)
+      end)
+      |> Enum.map(fn issue ->
+        %{
+          issue_id: issue.id,
+          identifier: issue.identifier,
+          issue_url: issue.url,
+          state: issue.state,
+          worker_host: affinity_host(state, issue.id),
+          priority: issue.priority
+        }
+      end)
+
     required_hosts =
       state.worker_affinities
       |> Map.values()
@@ -2030,6 +2133,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       pending: pending,
        demand: %{
          eligible: state.demand_eligible,
          dependency_blocked: state.demand_dependency_blocked,

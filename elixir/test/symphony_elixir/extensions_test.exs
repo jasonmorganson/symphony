@@ -304,6 +304,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "running" => 1,
                "retrying" => 1,
                "blocked" => 1,
+               "pending" => 0,
                "dependency_blocked" => 1,
                "observed" => 1
              },
@@ -396,6 +397,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "pending" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -770,6 +772,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "running" => 1,
              "retrying" => 1,
              "blocked" => 1,
+             "pending" => 0,
              "dependency_blocked" => 1,
              "observed" => 1
            }
