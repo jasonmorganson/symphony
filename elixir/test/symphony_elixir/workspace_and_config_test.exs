@@ -3,7 +3,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Linear.{Client, RateLimit}
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -1667,6 +1667,112 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "linear client normalizes rate limits and shares the cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :LinearRateLimit)
+    start_supervised!({RateLimit, name: rate_limit_name})
+
+    assert {:error, {:linear_rate_limited, 2_000}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    headers: %{"retry-after" => "2"},
+                    body: %{
+                      "errors" => [
+                        %{"extensions" => %{"code" => "RATELIMITED", "statusCode" => 429}}
+                      ]
+                    }
+                  }}
+               end
+             )
+
+    assert {:error, {:linear_rate_limited, remaining_ms}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers -> flunk("cooldown must prevent the request") end
+             )
+
+    assert remaining_ms in 1..2_000
+  end
+
+  test "linear client normalizes HTTP 429 and resumes after its cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :HttpLinearRateLimit)
+    start_supervised!({RateLimit, name: rate_limit_name})
+
+    assert {:error, {:linear_rate_limited, 0}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok, %{status: 429, headers: %{"retry-after" => "0"}, body: %{}}}
+               end
+             )
+
+    assert {:ok, %{"data" => %{"viewer" => %{"id" => "recovered"}}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               rate_limit_server: rate_limit_name,
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 200,
+                    body: %{"data" => %{"viewer" => %{"id" => "recovered"}}}
+                  }}
+               end
+             )
+
+    assert :ok = RateLimit.activate(0)
+    assert :ok = RateLimit.check()
+  end
+
+  test "linear requests are proactively spaced without bypassing a later cooldown" do
+    rate_limit_name = Module.concat(__MODULE__, :PacedLinearRateLimit)
+    start_supervised!({RateLimit, name: rate_limit_name})
+
+    started_at = System.monotonic_time(:millisecond)
+    assert :ok = RateLimit.acquire(35, rate_limit_name)
+    assert :ok = RateLimit.acquire(35, rate_limit_name)
+    assert System.monotonic_time(:millisecond) - started_at >= 25
+
+    assert :ok = RateLimit.activate(40, rate_limit_name)
+    assert {:error, {:linear_rate_limited, check_remaining_ms}} = RateLimit.check(rate_limit_name)
+    assert check_remaining_ms in 1..40
+
+    assert {:error, {:linear_rate_limited, acquire_remaining_ms}} =
+             RateLimit.acquire(35, rate_limit_name)
+
+    assert acquire_remaining_ms in 1..40
+    Process.sleep(45)
+
+    assert :ok = RateLimit.acquire(80, rate_limit_name)
+    previous_request_at_ms = :sys.get_state(rate_limit_name).next_request_at_ms
+    task = Task.async(fn -> RateLimit.acquire(80, rate_limit_name) end)
+
+    assert Enum.any?(1..100, fn _attempt ->
+             if :sys.get_state(rate_limit_name).next_request_at_ms > previous_request_at_ms do
+               true
+             else
+               Process.sleep(1)
+               false
+             end
+           end)
+
+    assert :ok = RateLimit.activate(100, rate_limit_name)
+    assert {:error, {:linear_rate_limited, remaining_ms}} = Task.await(task)
+    assert remaining_ms in 1..100
+
+    assert :ok = RateLimit.activate(0)
+    assert :ok = RateLimit.acquire(0)
   end
 
   test "linear client recognizes atom-keyed Linear rate-limit wrappers" do
