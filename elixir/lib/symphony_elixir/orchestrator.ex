@@ -1800,17 +1800,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp worker_host_reserved_for_other_retry?(%State{} = state, worker_host, issue_id)
        when is_binary(worker_host) do
+    case worker_host_retry_reservation_owner(state, worker_host) do
+      nil -> false
+      ^issue_id when is_binary(issue_id) -> false
+      _other_issue_id -> true
+    end
+  end
+
+  defp worker_host_retry_reservation_owner(%State{} = state, worker_host)
+       when is_binary(worker_host) do
     reservation_deadline_ms =
       System.monotonic_time(:millisecond) + @retry_worker_reservation_window_ms
 
-    Enum.any?(state.retry_attempts, fn
-      {retry_issue_id, %{worker_host: ^worker_host, due_at_ms: due_at_ms}}
-      when retry_issue_id != issue_id and is_integer(due_at_ms) ->
+    state.retry_attempts
+    |> Enum.filter(fn
+      {_retry_issue_id, %{worker_host: ^worker_host, due_at_ms: due_at_ms}}
+      when is_integer(due_at_ms) ->
         due_at_ms <= reservation_deadline_ms
 
       _ ->
         false
     end)
+    |> Enum.min_by(
+      fn {retry_issue_id, %{due_at_ms: due_at_ms}} -> {due_at_ms, retry_issue_id} end,
+      fn -> nil end
+    )
+    |> case do
+      nil -> nil
+      {retry_issue_id, _retry} -> retry_issue_id
+    end
   end
 
   defp available_worker_hosts(%State{} = state) do

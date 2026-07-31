@@ -1580,6 +1580,61 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, nil) == "worker-a"
   end
 
+  test "select_worker_host_for_test gives a shared durable host to one imminent retry at a time" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a", "worker-b"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    now_ms = System.monotonic_time(:millisecond)
+
+    state = %Orchestrator.State{
+      retry_attempts: %{
+        "later-retry" => %{
+          worker_host: "worker-a",
+          due_at_ms: now_ms + 60_000
+        },
+        "earlier-retry" => %{
+          worker_host: "worker-a",
+          due_at_ms: now_ms + 30_000
+        }
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "earlier-retry") ==
+             "worker-a"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "later-retry") ==
+             :no_worker_capacity
+
+    state = update_in(state.retry_attempts, &Map.delete(&1, "earlier-retry"))
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "later-retry") ==
+             "worker-a"
+  end
+
+  test "select_worker_host_for_test breaks equal-time retry reservations by issue id" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["worker-a"],
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    due_at_ms = System.monotonic_time(:millisecond) + 30_000
+
+    state = %Orchestrator.State{
+      retry_attempts: %{
+        "retry-b" => %{worker_host: "worker-a", due_at_ms: due_at_ms},
+        "retry-a" => %{worker_host: "worker-a", due_at_ms: due_at_ms}
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "retry-a") ==
+             "worker-a"
+
+    assert Orchestrator.select_worker_host_for_test(state, "worker-a", "retry-b") ==
+             :no_worker_capacity
+  end
+
   test "restoring a drained worker wakes capacity-blocked retries without preserving deployment backoff" do
     capacity_timer = Process.send_after(self(), :stale_capacity_retry, 60_000)
     capacity_token = make_ref()
