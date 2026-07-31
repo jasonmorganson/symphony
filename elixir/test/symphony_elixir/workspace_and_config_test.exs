@@ -1744,8 +1744,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert :ok = RateLimit.activate(40, rate_limit_name)
     assert {:error, {:linear_rate_limited, check_remaining_ms}} = RateLimit.check(rate_limit_name)
     assert check_remaining_ms in 1..40
+
     assert {:error, {:linear_rate_limited, acquire_remaining_ms}} =
              RateLimit.acquire(35, rate_limit_name)
+
     assert acquire_remaining_ms in 1..40
     Process.sleep(45)
 
