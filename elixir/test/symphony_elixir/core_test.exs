@@ -1059,6 +1059,31 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "pending retries reserve capacity ahead of new issues" do
+    running_entry = %{worker_host: "worker-0"}
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{"running" => running_entry},
+      retry_attempts: %{
+        "retry-1" => %{attempt: 4},
+        "retry-2" => %{attempt: 9}
+      }
+    }
+
+    refute Orchestrator.new_issue_slots_available_for_test(state)
+
+    assert Orchestrator.new_issue_slots_available_for_test(%{
+             state
+             | retry_attempts: %{"retry-1" => %{attempt: 4}}
+           })
+  end
+
+  test "capacity deferral stays prompt without consuming failure attempts" do
+    assert Orchestrator.retry_delay_for_test(12, %{delay_type: :capacity}) == 1_000
+    assert Orchestrator.retry_delay_for_test(12, %{}) == 300_000
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
