@@ -133,6 +133,8 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  model: gpt-5.6-terra
+  reasoning_effort: medium
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -153,6 +155,11 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- `codex.model` and `codex.reasoning_effort` are the workflow defaults. A task can override either
+  setting with exactly one `model:<model-id>` or `reasoning:<effort>` label. Symphony snapshots
+  those labels when the agent run starts and uses the same values for every continuation turn.
+  Conflicting or empty setting labels, and Codex-rejected overrides, block the task without retrying
+  until one of its setting labels changes.
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
@@ -191,7 +198,9 @@ hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
-  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+  command: "$CODEX_BIN app-server"
+  model: gpt-5.6-terra
+  reasoning_effort: medium
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.

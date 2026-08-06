@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Codex.TaskSettings, Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -18,6 +18,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
+          task_settings: TaskSettings.t(),
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
@@ -26,7 +29,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, issue, opts) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -35,18 +38,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
-  def start_session(workspace, opts \\ []) do
+  @spec start_session(Path.t(), map(), keyword()) :: {:ok, session()} | {:error, term()}
+  def start_session(workspace, issue, opts \\ []) when is_map(issue) do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, task_settings} <- resolve_task_settings(issue, opts),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+             do_start_session(port, expanded_workspace, session_policies, task_settings, dynamic_tool_binding) do
         {:ok,
          %{
            port: port,
@@ -55,6 +59,9 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_requests: session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
+           model: task_settings.model,
+           reasoning_effort: task_settings.reasoning_effort,
+           task_settings: task_settings,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
@@ -76,6 +83,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
+          task_settings: task_settings,
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
@@ -91,7 +99,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, task_settings) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -136,6 +144,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
       {:error, reason} ->
+        reason = maybe_task_configuration_error(reason, task_settings)
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
@@ -304,10 +313,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp resolve_task_settings(issue, opts) do
+    case Keyword.fetch(opts, :task_settings) do
+      {:ok, task_settings} when is_map(task_settings) -> {:ok, task_settings}
+      :error -> TaskSettings.resolve(issue, Config.settings!().codex)
+    end
+  end
+
+  defp do_start_session(port, workspace, session_policies, task_settings, dynamic_tool_binding) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        case start_thread(port, workspace, session_policies, task_settings, dynamic_tool_binding) do
+          {:error, reason} -> {:error, maybe_task_configuration_error(reason, task_settings)}
+          result -> result
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -315,18 +337,27 @@ defmodule SymphonyElixir.Codex.AppServer do
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         %{model: model},
          dynamic_tool_binding
        ) do
-    send_message(port, %{
-      "method" => "thread/start",
-      "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => dynamic_tool_binding.tool_specs
-      }
-    })
+    params = %{
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace,
+      "dynamicTools" => dynamic_tool_binding.tool_specs
+    }
+
+    send_message(
+      port,
+      maybe_put(params, "model", model)
+      |> then(
+        &%{
+          "method" => "thread/start",
+          "id" => @thread_start_id,
+          "params" => &1
+        }
+      )
+    )
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
@@ -340,24 +371,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
-        "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
-      }
-    })
+  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, task_settings) do
+    params = %{
+      "threadId" => thread_id,
+      "input" => [
+        %{
+          "type" => "text",
+          "text" => prompt
+        }
+      ],
+      "cwd" => workspace,
+      "title" => "#{issue.identifier}: #{issue.title}",
+      "approvalPolicy" => approval_policy,
+      "sandboxPolicy" => turn_sandbox_policy
+    }
+
+    %{model: model, reasoning_effort: reasoning_effort} = task_settings
+
+    send_message(
+      port,
+      params
+      |> maybe_put("model", model)
+      |> maybe_put("effort", reasoning_effort)
+      |> then(
+        &%{
+          "method" => "turn/start",
+          "id" => @turn_start_id,
+          "params" => &1
+        }
+      )
+    )
 
     case await_response(port, @turn_start_id) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
@@ -375,6 +418,15 @@ defmodule SymphonyElixir.Codex.AppServer do
       auto_approve_requests
     )
   end
+
+  defp maybe_put(params, _key, nil), do: params
+  defp maybe_put(params, key, value), do: Map.put(params, key, value)
+
+  defp maybe_task_configuration_error({:response_error, _} = reason, %{overridden?: true}) do
+    {:task_configuration_error, reason}
+  end
+
+  defp maybe_task_configuration_error(reason, _task_settings), do: reason
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do

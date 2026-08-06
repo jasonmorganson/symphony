@@ -178,9 +178,13 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    @type t :: %__MODULE__{}
+
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:model, :string)
+      field(:reasoning_effort, :string)
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -206,6 +210,8 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :model,
+          :reasoning_effort,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -223,9 +229,17 @@ defmodule SymphonyElixir.Config.Schema do
           []
         end
       end)
+      |> validate_optional_nonblank(:model)
+      |> validate_optional_nonblank(:reasoning_effort)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    defp validate_optional_nonblank(changeset, field) do
+      validate_change(changeset, field, fn ^field, value ->
+        if String.trim(value) == "", do: [{field, "can't be blank"}], else: []
+      end)
     end
   end
 

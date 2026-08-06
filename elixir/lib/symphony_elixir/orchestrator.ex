@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Codex.TaskSettings, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -159,6 +159,8 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:model, runtime_info[:model])
+          |> maybe_put_runtime_value(:reasoning_effort, runtime_info[:reasoning_effort])
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -187,6 +189,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  def handle_info({:task_configuration_error, issue_id, fingerprint, reason}, %{running: running} = state)
+      when is_binary(issue_id) and is_list(fingerprint) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        error = TaskSettings.format_error(reason)
+
+        Logger.warning("Agent task blocked by Codex configuration for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}: #{error}")
+
+        state =
+          block_issue_from_entry(state, issue_id, running_entry, error, configuration_fingerprint: fingerprint)
+
+        notify_dashboard()
+        {:noreply, state}
+    end
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
@@ -478,7 +499,12 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_blocked_issue_state(state, issue)
+        if task_configuration_changed?(state, issue) do
+          Logger.info("Task Codex configuration changed for blocked issue #{issue_context(issue)}; releasing block")
+          release_issue_claim(state, issue.id)
+        else
+          refresh_blocked_issue_state(state, issue)
+        end
 
       true ->
         Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
@@ -767,19 +793,22 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
+  defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error, opts \\ []) do
     blocked_entry = %{
       issue_id: issue_id,
       identifier: Map.get(running_entry, :identifier, issue_id),
       issue: Map.get(running_entry, :issue),
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
+      model: Map.get(running_entry, :model),
+      reasoning_effort: Map.get(running_entry, :reasoning_effort),
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      configuration_fingerprint: Keyword.get(opts, :configuration_fingerprint)
     }
 
     %{
@@ -789,6 +818,13 @@ defmodule SymphonyElixir.Orchestrator do
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
+  end
+
+  defp task_configuration_changed?(state, %Issue{} = issue) do
+    case get_in(state.blocked, [issue.id, :configuration_fingerprint]) do
+      fingerprint when is_list(fingerprint) -> fingerprint != TaskSettings.fingerprint(issue)
+      _ -> false
+    end
   end
 
   defp choose_issues(issues, state) do
@@ -984,6 +1020,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue: issue,
             worker_host: worker_host,
             workspace_path: nil,
+            model: nil,
+            reasoning_effort: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1449,6 +1487,8 @@ defmodule SymphonyElixir.Orchestrator do
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
+          model: Map.get(metadata, :model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
@@ -1488,6 +1528,8 @@ defmodule SymphonyElixir.Orchestrator do
           state: blocked_issue_state(metadata),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
+          model: Map.get(metadata, :model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
           session_id: Map.get(metadata, :session_id),
           error: Map.get(metadata, :error),
           blocked_at: Map.get(metadata, :blocked_at),

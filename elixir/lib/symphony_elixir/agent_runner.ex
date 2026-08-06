@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.{AppServer, TaskSettings}
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -30,28 +30,76 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        if TaskSettings.configuration_error?(reason) do
+          Logger.warning("Agent run blocked by task Codex configuration for #{issue_context(issue)}: #{TaskSettings.format_error(reason)}")
+
+          send_task_configuration_error(codex_update_recipient, issue, TaskSettings.fingerprint(issue), reason)
+          :ok
+        else
+          Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+          raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        end
     end
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with {:ok, task_settings} <- TaskSettings.resolve(issue, Config.settings!().codex),
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+      Logger.info("Resolved task Codex settings for #{issue_context(issue)} model=#{inspect(task_settings.model)} reasoning_effort=#{inspect(task_settings.reasoning_effort)}")
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, task_settings)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          run_codex_turns(workspace, issue, task_settings, codex_update_recipient, opts, worker_host)
         end
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
+    end
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp send_task_configuration_error(recipient, %Issue{id: issue_id}, fingerprint, reason)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(recipient, {:task_configuration_error, issue_id, fingerprint, reason})
+    :ok
+  end
+
+  defp send_task_configuration_error(_recipient, _issue, _fingerprint, _reason), do: :ok
+
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, task_settings)
+       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
+    send(
+      recipient,
+      {:worker_runtime_info, issue_id,
+       %{
+         worker_host: worker_host,
+         workspace_path: workspace,
+         model: task_settings.model,
+         reasoning_effort: task_settings.reasoning_effort
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _task_settings), do: :ok
+
+  defp run_codex_turns(workspace, issue, task_settings, codex_update_recipient, opts, worker_host) do
+    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+
+    with {:ok, session} <-
+           AppServer.start_session(workspace, issue,
+             worker_host: worker_host,
+             task_settings: task_settings
+           ) do
+      try do
+        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+      after
+        AppServer.stop_session(session)
+      end
     end
   end
 
@@ -68,35 +116,6 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
-
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
-       when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
-    send(
-      recipient,
-      {:worker_runtime_info, issue_id,
-       %{
-         worker_host: worker_host,
-         workspace_path: workspace
-       }}
-    )
-
-    :ok
-  end
-
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
-
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
-
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
-    end
-  end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
