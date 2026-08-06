@@ -1,6 +1,126 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "app server sends task model and reasoning labels as JSON-RPC settings" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-task-settings-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-SETTINGS")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+      args_file = Path.join(test_root, "codex.args")
+      label_interpolation_marker = Path.join(test_root, "label-interpolated")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+      previous_args = System.get_env("SYMP_TEST_CODEX_ARGS")
+
+      on_exit(fn ->
+        if is_binary(previous_trace),
+          do: System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace),
+          else: System.delete_env("SYMP_TEST_CODEX_TRACE")
+
+        if is_binary(previous_args),
+          do: System.put_env("SYMP_TEST_CODEX_ARGS", previous_args),
+          else: System.delete_env("SYMP_TEST_CODEX_ARGS")
+      end)
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      System.put_env("SYMP_TEST_CODEX_ARGS", args_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      printf '%s\\n' "$@" > "$SYMP_TEST_CODEX_ARGS"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf '%s\\n' "$line" >> "$SYMP_TEST_CODEX_TRACE"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-settings"}}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-settings"}}}' ;;
+          4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_model: "gpt-5.6-terra",
+        codex_reasoning_effort: "medium"
+      )
+
+      issue = %Issue{
+        id: "issue-task-settings",
+        identifier: "MT-SETTINGS",
+        title: "Task settings",
+        state: "Active",
+        labels: ["model:gpt-5.6-terra; touch #{label_interpolation_marker}", "reasoning:high"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Use task settings", issue)
+
+      requests =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(requests, &(&1["method"] == "initialize"))
+
+      thread_start = Enum.find(requests, &(&1["method"] == "thread/start"))
+      turn_start = Enum.find(requests, &(&1["method"] == "turn/start"))
+
+      assert get_in(thread_start, ["params", "model"]) == "gpt-5.6-terra; touch #{label_interpolation_marker}"
+      assert get_in(turn_start, ["params", "model"]) == "gpt-5.6-terra; touch #{label_interpolation_marker}"
+      assert get_in(turn_start, ["params", "effort"]) == "high"
+      assert File.read!(args_file) == "app-server\n"
+      refute File.exists?(label_interpolation_marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server treats rejected task settings as task configuration errors" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-task-settings-error-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-SETTINGS-ERROR")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"error":{"message":"unsupported model"}}'; exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "issue-settings-error", identifier: "MT-SETTINGS-ERROR", title: "Task settings error", labels: ["model:not-available"]}
+
+      assert {:error, {:task_configuration_error, {:response_error, %{"message" => "unsupported model"}}}} =
+               AppServer.run(workspace, "Use task settings", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

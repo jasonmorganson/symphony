@@ -34,6 +34,9 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+The reference implementation can select Codex settings per Linear task with `model:<model-id>`
+and `reasoning:<effort>` labels; the workflow config supplies the defaults.
+
 ---
 
 ## License

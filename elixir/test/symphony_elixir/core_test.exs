@@ -925,6 +925,37 @@ defmodule SymphonyElixir.CoreTest do
     refute MapSet.member?(updated_state.claimed, issue_id)
   end
 
+  test "reconcile releases a task configuration block when its model or reasoning labels change" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ["Active"])
+
+    issue_id = "blocked-task-configuration"
+
+    state = %Orchestrator.State{
+      blocked: %{
+        issue_id => %{
+          identifier: "MT-SETTINGS",
+          error: "Codex rejected the task model or reasoning configuration",
+          configuration_fingerprint: ["model:not-available"]
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-SETTINGS",
+      title: "Correct task Codex settings",
+      state: "Active",
+      labels: ["model:gpt-5.6-terra", "reasoning:high"]
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+  end
+
   test "retry releases its claim when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 
