@@ -133,7 +133,7 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
-  model: gpt-5.6-terra
+  model: gpt-6-sol
   reasoning_effort: medium
 ---
 
@@ -199,7 +199,7 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN app-server"
-  model: gpt-5.6-terra
+  model: gpt-6-sol
   reasoning_effort: medium
 ```
 

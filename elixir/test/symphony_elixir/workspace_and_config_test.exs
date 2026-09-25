@@ -1052,11 +1052,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().tracker.required_labels == [""]
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
+      codex_command: "codex --config 'model=\"gpt-6-sol\"' app-server"
     )
 
     assert Config.settings!().codex.command ==
-             "codex --config 'model=\"gpt-5.5\"' app-server"
+             "codex --config 'model=\"gpt-6-sol\"' app-server"
 
     explicit_root =
       Path.join(

@@ -32,7 +32,7 @@ agent:
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
-  model: gpt-5.6-terra
+  model: gpt-6-sol
   reasoning_effort: medium
   approval_policy: never
   thread_sandbox: workspace-write

@@ -6,19 +6,19 @@ defmodule SymphonyElixir.Codex.TaskSettingsTest do
 
   test "task labels inherit defaults and override model or reasoning independently" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      codex_model: "gpt-5.6-terra",
+      codex_model: "gpt-6-sol",
       codex_reasoning_effort: "medium"
     )
 
     defaults = Config.settings!().codex
 
-    assert {:ok, %{model: "gpt-5.6-terra", reasoning_effort: "medium", overridden?: false}} =
+    assert {:ok, %{model: "gpt-6-sol", reasoning_effort: "medium", overridden?: false}} =
              TaskSettings.resolve(issue([]), defaults)
 
     assert {:ok, %{model: "gpt-5.6-terra", reasoning_effort: "medium", overridden?: true}} =
              TaskSettings.resolve(issue(["model:gpt-5.6-terra"]), defaults)
 
-    assert {:ok, %{model: "gpt-5.6-terra", reasoning_effort: "high", overridden?: true}} =
+    assert {:ok, %{model: "gpt-6-sol", reasoning_effort: "high", overridden?: true}} =
              TaskSettings.resolve(issue(["reasoning:high"]), defaults)
 
     assert {:ok, %{model: "gpt-5.6-sol", reasoning_effort: "xhigh", overridden?: true}} =
